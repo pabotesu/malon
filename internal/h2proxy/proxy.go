@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pabotesu/malon/internal/envelope"
 	"github.com/pabotesu/malon/internal/identity"
@@ -98,6 +99,21 @@ func (p *InternalProxy) Connected() <-chan struct{} {
 	return ch
 }
 
+// IsConnected reports whether the relay CONNECT stream is currently active.
+func (p *InternalProxy) IsConnected() bool {
+	select {
+	case <-p.Connected():
+		// connectedCh is closed → relay was established.
+		// Also verify writer is still set (not yet cleaned up by defer).
+		p.wrMu.Lock()
+		up := p.writer != nil
+		p.wrMu.Unlock()
+		return up
+	default:
+		return false
+	}
+}
+
 // Connect dials the Relay via HTTP/2 CONNECT and starts the readLoop.
 // It blocks until the connection is closed or ctx is cancelled.
 // The caller should retry with back-off on error.
@@ -114,10 +130,18 @@ func (p *InternalProxy) Connect(ctx context.Context) error {
 				InsecureSkipVerify: p.tlsInsecure, //nolint:gosec // intentional for testing
 				MinVersion:         tls.VersionTLS13,
 			},
+			// Send HTTP/2 PING after 15s of inactivity and close the
+			// connection if not acknowledged within 5s. This ensures
+			// network-change events (e.g. Wi-Fi → mobile) are detected
+			// quickly rather than waiting for the OS TCP timeout.
+			ReadIdleTimeout: 15 * time.Second,
+			PingTimeout:     5 * time.Second,
 		}
 	} else {
 		transport = &http2.Transport{
-			AllowHTTP: true,
+			AllowHTTP:       true,
+			ReadIdleTimeout: 15 * time.Second,
+			PingTimeout:     5 * time.Second,
 		}
 	}
 

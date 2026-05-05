@@ -105,8 +105,9 @@ func NewDirectClientTLSConfig(
 }
 
 // NewProbeServerTLSConfig returns a TLS config for the DirectListener server
-// side (ALPN "malon-probe"). Inbound probe connections must present a
-// certificate from a known peer.
+// side. The listener accepts both probe connections (ALPN "malon-probe") and
+// CONNECT-IP data connections (ALPN "h3") on the same UDP port so that the
+// NAT hole opened during probing can be reused for the actual data path.
 func NewProbeServerTLSConfig(
 	selfPriv ed25519.PrivateKey,
 	knownPeers map[identity.PeerID]struct{},
@@ -120,7 +121,7 @@ func NewProbeServerTLSConfig(
 		ClientAuth:            tls.RequireAnyClientCert,
 		InsecureSkipVerify:    true, //nolint:gosec
 		MinVersion:            tls.VersionTLS13,
-		NextProtos:            []string{alpnMalonProbe},
+		NextProtos:            []string{alpnMalonProbe, "h3"},
 		VerifyPeerCertificate: makePeerVerifier(knownPeers),
 	}, nil
 }

@@ -33,7 +33,6 @@ import (
 type peerEntry struct {
 	peer          *peer.Peer
 	relayURL      string
-	h3Addrs       []netip.AddrPort         // mion h3 endpoints received via h3proxy candidates
 	relayConn     *h2proxy.RelayTunnelConn // current relay conn; used for fallback after direct path breaks
 	hasDirectPath bool                     // true while a direct CONNECT-IP path is active
 }
@@ -304,7 +303,6 @@ func (m *Manager) setupRelayPeers(ctx context.Context, relayURL string) {
 		if entry.relayURL == relayURL {
 			ids = append(ids, id)
 			entry.hasDirectPath = false
-			entry.h3Addrs = nil // proxy may have restarted with a new DirectListener port
 		}
 	}
 	m.mu.Unlock()
@@ -372,8 +370,10 @@ func (m *Manager) connectPeerWithCtx(ctx context.Context, peerID identity.PeerID
 	return nil
 }
 
-// probeAcceptLoop accepts inbound "malon-probe" connections on the DirectListener
-// and records them as validated paths for Phase 5 path promotion.
+// directAcceptLoop accepts inbound connections on the DirectListener and
+// handles both probe events (ALPN "malon-probe") and CONNECT-IP data sessions
+// (ALPN "h3"). The two ALPNs share the same UDP port so that the NAT hole
+// opened by the probe is reused for the subsequent CONNECT-IP connection.
 func (m *Manager) probeAcceptLoop(ctx context.Context) {
 	defer m.directLn.Close()
 	for {
@@ -385,12 +385,41 @@ func (m *Manager) probeAcceptLoop(ctx context.Context) {
 			slog.Warn("manager: DirectListener accept error", "err", err)
 			return
 		}
-		slog.Info("manager: inbound probe accepted", "peer_id", ev.PeerID,
-			"remote", ev.Conn.RemoteAddr())
-		// Close the probe connection immediately — Phase 5 will reuse it for
-		// path promotion once both directions succeed.
-		_ = ev.Conn.CloseWithError(0, "probe ok")
+		switch e := ev.(type) {
+		case *direct.ProbeEvent:
+			slog.Info("manager: inbound probe accepted", "peer_id", e.PeerID, "remote", e.RemoteAddr)
+		case *direct.ConnectEvent:
+			slog.Info("manager: inbound direct CONNECT-IP accepted", "peer_id", e.PeerID)
+			go m.handleDirectConnect(e)
+		}
 	}
+}
+
+// handleDirectConnect promotes an inbound CONNECT-IP connection (from a remote
+// client that dialed our DirectListener) to the active data path.
+func (m *Manager) handleDirectConnect(e *direct.ConnectEvent) {
+	m.mu.RLock()
+	entry, ok := m.peers[e.PeerID]
+	m.mu.RUnlock()
+	if !ok {
+		slog.Warn("manager: inbound direct CONNECT-IP from unknown peer", "peer_id", e.PeerID)
+		_ = e.Conn.Close()
+		return
+	}
+
+	m.mu.Lock()
+	if entry.hasDirectPath {
+		m.mu.Unlock()
+		// Another goroutine already promoted; discard this connection.
+		_ = e.Conn.Close()
+		return
+	}
+	entry.hasDirectPath = true
+	m.mu.Unlock()
+
+	entry.peer.SetConn(e.Conn)
+	go m.forwardDirectConnToTUN(e.PeerID, entry.peer, e.Conn)
+	slog.Info("manager: promoted to direct path (inbound)", "peer_id", e.PeerID)
 }
 
 // acceptLoop handles incoming EnvelopeNetConns (initiated by remote peers).
@@ -433,7 +462,10 @@ func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 	defer cancel()
 	relayConn, err := h2proxy.NewRelayTunnelConnWithMTLS(handshakeCtx, envConn, tlsCfg, false)
 	if err != nil {
-		slog.Error("manager: inner mTLS handshake (server)", "peer_id", peerID, "err", err)
+		// This is expected when the client sends a fresh TLS ClientHello on a
+		// new relay session while the proxy still has an old session open.
+		// Not a fatal error — the client will immediately retry with a new session.
+		slog.Warn("manager: inner mTLS handshake (server)", "peer_id", peerID, "err", err)
 		envConn.Close()
 		return
 	}
@@ -542,21 +574,6 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 
 	all := append(embedded, stunned...)
 
-	// Proxy role only: advertise the mion h3 endpoint so the client knows which
-	// port to connect to for CONNECT-IP after probe succeeds.
-	// Client role does not have an h3 server, so h3proxy candidates are omitted.
-	if m.mion.Role() == "proxy" {
-		if h3port := m.mion.ListenPort(); h3port > 0 {
-			h3Candidates, err := candidate.CollectEmbedded(uint16(h3port), gen, []netip.Prefix{m.overlayPrefix})
-			if err == nil {
-				for i := range h3Candidates {
-					h3Candidates[i].Kind = candidate.KindH3Proxy
-				}
-				all = append(all, h3Candidates...)
-			}
-		}
-	}
-
 	if len(all) == 0 {
 		return
 	}
@@ -605,15 +622,6 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 		addr, err := netip.ParseAddrPort(ci.Addr)
 		if err != nil {
 			slog.Warn("manager: invalid candidate addr", "addr", ci.Addr, "err", err)
-			continue
-		}
-		// h3proxy candidates are not probed; they are stored for use in path promotion.
-		if ci.Kind == candidate.KindH3Proxy.String() {
-			m.mu.Lock()
-			if entry, ok := m.peers[peerID]; ok {
-				entry.h3Addrs = append(entry.h3Addrs, addr)
-			}
-			m.mu.Unlock()
 			continue
 		}
 		// Skip addresses that failed recently to avoid repeated timeout spam
@@ -674,47 +682,26 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 }
 
 // tryPromotePath attempts to promote a validated direct path to the active
-// data path for peerID. Only client-role nodes dial out; proxy-role nodes
-// wait for the client to connect via mion's h3 listener.
-//
-// The direct CONNECT-IP session is established to the peer's mion h3 endpoint
-// advertised via h3proxy candidates. We pick the h3proxy address whose host
-// matches the validated probe address, ensuring we use the same reachable path.
+// data path for peerID. After a successful probe, the client dials CONNECT-IP
+// to the same DirectListener address (result.RemoteAddr) that was probed.
+// This reuses the NAT hole opened during probing, enabling direct connectivity
+// through CGNAT without any port forwarding on the proxy side.
 func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.ValidatedTransport) {
 	m.mu.RLock()
 	entry, ok := m.peers[peerID]
-	h3Addrs := append([]netip.AddrPort(nil), entry.h3Addrs...)
 	alreadyDirect := entry.hasDirectPath
 	m.mu.RUnlock()
 	if !ok || alreadyDirect {
 		return
 	}
 
-	// Find a h3proxy address whose host matches the validated probe host.
-	probeHost := result.RemoteAddr.Addr()
-	var proxyAddr netip.AddrPort
-	for _, a := range h3Addrs {
-		if a.Addr() == probeHost {
-			proxyAddr = a
-			break
-		}
-	}
-	if !proxyAddr.IsValid() {
-		slog.Debug("manager: no h3proxy candidate matches validated probe host, skipping promotion",
-			"peer_id", peerID, "probe_host", probeHost)
-		return
-	}
-
-	// Pass m.ctx (not a timeout-derived context) so that the CONNECT-IP
-	// HTTP/3 request stream lives for the full connection lifetime.
-	// connectip.Dial passes ctx to OpenRequestStream, which ties the stream
-	// to the context — using a timeout context here would cancel the stream
-	// when tryPromotePath returns, immediately closing the direct path.
-	// QUIC has its own internal dial timeout, so no extra timeout is needed.
-	conn, err := direct.Dial(m.ctx, m.selfPriv, proxyAddr, peerID)
+	// Dial CONNECT-IP to the same address that was probed. The probe's QUIC
+	// Initial/Handshake opened a NAT mapping; this new QUIC connection reuses
+	// that mapping without requiring any port forwarding on the proxy.
+	conn, err := direct.Dial(m.ctx, m.selfPriv, result.RemoteAddr, peerID)
 	if err != nil {
 		slog.Warn("manager: direct path promotion failed",
-			"peer_id", peerID, "addr", proxyAddr, "err", err)
+			"peer_id", peerID, "addr", result.RemoteAddr, "err", err)
 		return
 	}
 
@@ -734,7 +721,7 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 	go m.forwardDirectConnToTUN(peerID, entry.peer, conn)
 	slog.Info("manager: promoted to direct path",
 		"peer_id", peerID,
-		"addr", proxyAddr,
+		"addr", result.RemoteAddr,
 		"rtt", result.RTT,
 	)
 }
@@ -826,13 +813,41 @@ func (m *Manager) retryConnectPeer(peerID identity.PeerID) {
 		if m.ctx.Err() != nil {
 			return
 		}
-		// Stop retrying if a new direct path has already been promoted.
 		m.mu.RLock()
-		alreadyDirect := m.peers[peerID] != nil && m.peers[peerID].hasDirectPath
+		e := m.peers[peerID]
+		alreadyDirect := e != nil && e.hasDirectPath
+		// setupRelayPeers (called by relayConnectLoop on reconnect) may have
+		// already restored the relay session — if so, stop retrying.
+		alreadyRelay := e != nil && e.relayConn != nil
+		relayURL := ""
+		if e != nil {
+			relayURL = e.relayURL
+		}
 		m.mu.RUnlock()
-		if alreadyDirect {
+		if alreadyDirect || alreadyRelay {
 			return
 		}
+
+		// If the relay H2 connection itself is down, don't attempt mTLS —
+		// relayConnectLoop will reconnect and call setupRelayPeers.
+		// We just wait with backoff and check again.
+		if relayURL != "" {
+			proxy := m.getOrCreateProxy(relayURL)
+			if !proxy.IsConnected() {
+				slog.Debug("manager: relay not connected, waiting for relayConnectLoop",
+					"peer_id", peerID, "backoff", backoff)
+				select {
+				case <-m.ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+				if backoff < maxBackoff {
+					backoff *= 2
+				}
+				continue
+			}
+		}
+
 		if err := m.connectPeerWithCtx(m.ctx, peerID); err == nil {
 			slog.Info("manager: restored relay path after direct path failure", "peer_id", peerID)
 			return

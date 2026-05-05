@@ -39,19 +39,22 @@ func (c *DirectConn) Close() error {
 	return c.inner.Close()
 }
 
-// Dial establishes a direct QUIC + CONNECT-IP session to addr, verifying that
-// the remote node's mTLS certificate belongs to expectedPeerID.
-// addr is the DirectListener port on the remote peer (ALPN "malon-probe" for
-// the handshake, then upgrading to CONNECT-IP on the proxy's h3 endpoint).
+// Dial establishes a direct QUIC + CONNECT-IP session to the peer's
+// DirectListener port (the same port that was used for the probe).
 //
-// Design note: the DirectListener (ALPN "malon-probe") is used only for
-// reachability probing. The actual data path is established by dialing the
-// remote peer's mion proxy h3 endpoint (ALPN "h3") directly. proxyAddr is
-// the mion proxy h3 address (host:port from the peer config).
+// Design: the probe (ALPN "malon-probe") opens a NAT mapping from the client's
+// ephemeral UDP port to the peer's DirectListener port. By dialing CONNECT-IP
+// (ALPN "h3") to the same addr from a new UDP socket, the QUIC Initial packet
+// arrives at an already-open NAT entry on the peer side, making the connection
+// work even through CGNAT without any port forwarding.
+//
+// addr is the validated DirectListener address returned by the probe (i.e.
+// result.RemoteAddr from h3path.ValidatedTransport). It is NOT the mion h3
+// proxy port (4443) — that port is inaccessible behind NAT.
 func Dial(
 	ctx context.Context,
 	selfPriv ed25519.PrivateKey,
-	proxyAddr netip.AddrPort,
+	addr netip.AddrPort,
 	expectedPeerID identity.PeerID,
 ) (*DirectConn, error) {
 	tlsCfg, err := auth.NewDirectClientTLSConfig(selfPriv, expectedPeerID)
@@ -65,7 +68,7 @@ func Dial(
 	}
 
 	tr := &quic.Transport{Conn: udpConn}
-	udpAddr := net.UDPAddrFromAddrPort(proxyAddr)
+	udpAddr := net.UDPAddrFromAddrPort(addr)
 
 	qconn, err := tr.Dial(ctx, udpAddr, tlsCfg, &quic.Config{
 		EnableDatagrams: true,
@@ -73,17 +76,17 @@ func Dial(
 	})
 	if err != nil {
 		_ = tr.Close()
-		return nil, fmt.Errorf("direct: QUIC dial %s: %w", proxyAddr, err)
+		return nil, fmt.Errorf("direct: QUIC dial %s: %w", addr, err)
 	}
 
 	h3tr := &http3.Transport{EnableDatagrams: true}
 	hconn := h3tr.NewClientConn(qconn)
 
 	var authority string
-	if proxyAddr.Addr().Is6() {
-		authority = fmt.Sprintf("[%s]:%d", proxyAddr.Addr(), proxyAddr.Port())
+	if addr.Addr().Is6() {
+		authority = fmt.Sprintf("[%s]:%d", addr.Addr(), addr.Port())
 	} else {
-		authority = proxyAddr.String()
+		authority = addr.String()
 	}
 	template := uritemplate.MustNew(fmt.Sprintf("https://%s/mion", authority))
 
@@ -91,7 +94,7 @@ func Dial(
 	if err != nil {
 		_ = qconn.CloseWithError(0, "connect-ip failed")
 		_ = tr.Close()
-		return nil, fmt.Errorf("direct: CONNECT-IP dial %s: %w", proxyAddr, err)
+		return nil, fmt.Errorf("direct: CONNECT-IP dial %s: %w", addr, err)
 	}
 
 	return &DirectConn{inner: ipconn}, nil
