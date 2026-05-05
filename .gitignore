@@ -1,6 +1,8 @@
 # Binaries
 bin/
 *.exe
+malond
+malon-relayd
 
 # OS files
 .DS_Store

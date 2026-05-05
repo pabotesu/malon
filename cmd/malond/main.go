@@ -78,7 +78,7 @@ func main() {
 	}
 
 	// Create Manager (no global relay URL; each peer carries its own).
-	mgr := manager.New(selfPriv, false, mionInst)
+	mgr := manager.New(selfPriv, cfg.Interface.InsecureSkipVerify, mionInst)
 
 	// Register peers into both mion and manager.
 	for _, pc := range cfg.Peers {

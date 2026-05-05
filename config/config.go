@@ -43,10 +43,11 @@ type Config struct {
 
 // InterfaceConfig は [Interface] セクションを表す。
 type InterfaceConfig struct {
-	PrivateKey string       // base64 encoded Ed25519 private key (seed or full)
-	Address    netip.Prefix // TUN アドレス (e.g. 100.100.0.1/24)
-	Role       string       // "client" or "proxy" (default: "client")
-	ListenPort string       // proxy mode: "http3://:443" or "http3://:443, http2://:4443"
+	PrivateKey         string       // base64 encoded Ed25519 private key (seed or full)
+	Address            netip.Prefix // TUN アドレス (e.g. 100.100.0.1/24)
+	Role               string       // "client" or "proxy" (default: "client")
+	ListenPort         string       // proxy mode: "http3://:443" or "http3://:443, http2://:4443"
+	InsecureSkipVerify bool         // skip relay TLS cert verification (testing only)
 }
 
 // PeerConfig は [Peer] セクションを表す。
@@ -139,6 +140,8 @@ func parseInterfaceField(iface *InterfaceConfig, key, val string) error {
 		iface.Role = lower
 	case "ListenPort":
 		iface.ListenPort = val // proxy mode; parsed in main.go with parseMionListenEndpoints
+	case "InsecureSkipVerify":
+		iface.InsecureSkipVerify = strings.ToLower(val) == "true"
 	default:
 		return fmt.Errorf("config: unknown Interface key %q", key)
 	}
