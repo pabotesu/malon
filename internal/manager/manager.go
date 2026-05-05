@@ -31,10 +31,11 @@ import (
 // peerEntry holds a mion peer and the relay URL used to reach it (empty for
 // proxy-role peers that are reached directly, not through a relay).
 type peerEntry struct {
-	peer      *peer.Peer
-	relayURL  string
-	h3Addrs   []netip.AddrPort         // mion h3 endpoints received via h3proxy candidates
-	relayConn *h2proxy.RelayTunnelConn // current relay conn; used for fallback after direct path breaks
+	peer          *peer.Peer
+	relayURL      string
+	h3Addrs       []netip.AddrPort         // mion h3 endpoints received via h3proxy candidates
+	relayConn     *h2proxy.RelayTunnelConn // current relay conn; used for fallback after direct path breaks
+	hasDirectPath bool                     // true while a direct CONNECT-IP path is active
 }
 
 // Manager coordinates transport paths for all known peers.
@@ -602,6 +603,17 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 		}
 		m.probeCooldownMu.Unlock()
 
+		// Skip probing if a direct path is already active for this peer.
+		// Once promoted, further candidate probing is unnecessary until the
+		// direct path breaks and we fall back to relay.
+		m.mu.RLock()
+		alreadyDirect := m.peers[peerID] != nil && m.peers[peerID].hasDirectPath
+		m.mu.RUnlock()
+		if alreadyDirect {
+			slog.Debug("manager: skipping probe (direct path active)", "addr", addr)
+			continue
+		}
+
 		go func() {
 			probeCtx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
 			defer cancel()
@@ -686,6 +698,12 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 		"addr", proxyAddr,
 		"rtt", result.RTT,
 	)
+
+	m.mu.Lock()
+	if e, ok := m.peers[peerID]; ok {
+		e.hasDirectPath = true
+	}
+	m.mu.Unlock()
 }
 
 // forwardDirectConnToTUN reads IP packets from a direct connection and writes
@@ -728,9 +746,12 @@ func (m *Manager) forwardDirectConnToTUN(peerID identity.PeerID, p *peer.Peer, d
 // If no relay conn is stored, the peer will have no active transport until the
 // relay reconnects and re-establishes the session.
 func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
-	m.mu.RLock()
+	m.mu.Lock()
 	entry, ok := m.peers[peerID]
-	m.mu.RUnlock()
+	if ok {
+		entry.hasDirectPath = false
+	}
+	m.mu.Unlock()
 	if !ok {
 		return
 	}
