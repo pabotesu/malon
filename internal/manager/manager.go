@@ -346,27 +346,31 @@ func (m *Manager) handleControl(msg h2proxy.ControlMessage) {
 	}
 }
 
-// sendCandidates collects embedded and stuned candidates for this node and
-// sends them to the given peer via a CONTROL capsule. Only proxy-role nodes
-// (those with a mion listener port > 0) advertise candidates.
+// sendCandidates collects candidates for this node and sends them to the
+// given peer via a CONTROL capsule. Both proxy and client nodes send
+// candidates: proxy sends embedded (local IPs + listen port) and STUN;
+// client sends STUN only (no fixed listen port yet, but needed for future P2P
+// hole punching).
 func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnelConn) {
-	if m.mion == nil || m.mion.Role() != "proxy" {
-		return
-	}
-	port := uint16(m.mion.ListenPort())
-	if port == 0 {
+	if m.mion == nil {
 		return
 	}
 
 	gen := m.generation
 
-	// Collect embedded candidates (local interface IPs + listen port).
-	embedded, err := candidate.CollectEmbedded(port, gen)
-	if err != nil {
-		slog.Warn("manager: collect embedded candidates failed", "err", err)
+	// Collect embedded candidates only when we have a fixed listen port
+	// (proxy role). Clients have no stable incoming port yet.
+	var embedded []candidate.Candidate
+	port := uint16(m.mion.ListenPort())
+	if port > 0 {
+		var err error
+		embedded, err = candidate.CollectEmbedded(port, gen)
+		if err != nil {
+			slog.Warn("manager: collect embedded candidates failed", "err", err)
+		}
 	}
 
-	// Collect stuned candidate via STUN.
+	// Collect stuned candidate via STUN (both roles).
 	stunCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv := m.stunServer
@@ -376,7 +380,7 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 	stunAddr, err := stun.Query(stunCtx, srv)
 	var stunned []candidate.Candidate
 	if err != nil {
-		slog.Debug("manager: STUN query failed", "err", err)
+		slog.Warn("manager: STUN query failed", "err", err)
 	} else {
 		stunned = []candidate.Candidate{{
 			Kind:       candidate.KindStuned,
