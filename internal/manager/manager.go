@@ -682,24 +682,28 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 }
 
 // tryPromotePath attempts to promote a validated direct path to the active
-// data path for peerID. After a successful probe, the client dials CONNECT-IP
-// to the same DirectListener address (result.RemoteAddr) that was probed.
-// This reuses the NAT hole opened during probing, enabling direct connectivity
-// through CGNAT without any port forwarding on the proxy side.
+// data path for peerID. It reuses result.Transport (the UDP socket used for
+// the probe) so that CONNECT-IP traffic flows from the exact same local port —
+// hitting the same NAT entry the probe opened. This works through symmetric
+// NAT, not just cone NAT.
+// Ownership of result.Transport is transferred: this function or the returned
+// DirectConn will always close it.
 func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.ValidatedTransport) {
 	m.mu.RLock()
 	entry, ok := m.peers[peerID]
 	alreadyDirect := entry.hasDirectPath
 	m.mu.RUnlock()
 	if !ok || alreadyDirect {
+		_ = result.Transport.Close()
 		return
 	}
 
-	// Dial CONNECT-IP to the same address that was probed. The probe's QUIC
-	// Initial/Handshake opened a NAT mapping; this new QUIC connection reuses
-	// that mapping without requiring any port forwarding on the proxy.
-	conn, err := direct.Dial(m.ctx, m.selfPriv, result.RemoteAddr, peerID)
+	// Dial CONNECT-IP using the same UDP transport as the probe.
+	// result.Transport ownership passes to direct.Dial (and then to DirectConn).
+	conn, err := direct.Dial(m.ctx, m.selfPriv, result.RemoteAddr, peerID, result.Transport)
 	if err != nil {
+		// Transport is NOT closed here — direct.Dial does not take ownership on error.
+		_ = result.Transport.Close()
 		slog.Warn("manager: direct path promotion failed",
 			"peer_id", peerID, "addr", result.RemoteAddr, "err", err)
 		return
@@ -711,7 +715,7 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 	e, ok2 := m.peers[peerID]
 	if !ok2 || e.hasDirectPath {
 		m.mu.Unlock()
-		_ = conn.Close()
+		_ = conn.Close() // also closes result.Transport
 		return
 	}
 	e.hasDirectPath = true
