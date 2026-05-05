@@ -88,5 +88,16 @@ func Dial(
 		return nil, fmt.Errorf("direct: CONNECT-IP dial %s: %w", addr, err)
 	}
 
+	// Advertise all IPv4 destinations so that incoming datagrams from the
+	// proxy pass the destination-address check in ReadPacket on our side.
+	if err := ipconn.AdvertiseRoute(ctx, []connectip.IPRoute{{
+		StartIP:    netip.MustParseAddr("0.0.0.0"),
+		EndIP:      netip.MustParseAddr("255.255.255.255"),
+		IPProtocol: 0, // all protocols
+	}}); err != nil {
+		_ = qconn.CloseWithError(0, "route advertisement failed")
+		return nil, fmt.Errorf("direct: CONNECT-IP route advertisement %s: %w", addr, err)
+	}
+
 	return &DirectConn{inner: ipconn}, nil
 }

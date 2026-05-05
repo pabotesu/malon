@@ -201,6 +201,19 @@ func (l *Listener) handleConnect(conn *quic.Conn) (*ConnectEvent, error) {
 				ch <- result{err: proxyErr}
 				return
 			}
+			// Advertise all IPv4 destinations so that incoming datagrams from
+			// the peer pass the destination-address check in ReadPacket.
+			// Without this, connect-ip-go drops every packet because no
+			// routes have been declared as acceptable.
+			advErr := ipconn.AdvertiseRoute(r.Context(), []connectip.IPRoute{{
+				StartIP:    netip.MustParseAddr("0.0.0.0"),
+				EndIP:      netip.MustParseAddr("255.255.255.255"),
+				IPProtocol: 0, // all protocols
+			}})
+			if advErr != nil {
+				ch <- result{err: advErr}
+				return
+			}
 			ch <- result{ipconn: ipconn}
 		}),
 	}
