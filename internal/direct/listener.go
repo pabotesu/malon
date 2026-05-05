@@ -88,7 +88,7 @@ func New(selfPriv ed25519.PrivateKey, knownPeers map[identity.PeerID]struct{}) (
 	tr := &quic.Transport{Conn: udpConn}
 	ln, err := tr.Listen(tlsCfg, &quic.Config{
 		EnableDatagrams: true,
-		MaxIdleTimeout:  30 * time.Second, // must match client side
+		MaxIdleTimeout:  15 * time.Second, // must match client side
 	})
 	if err != nil {
 		_ = tr.Close()

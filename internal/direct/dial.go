@@ -66,7 +66,7 @@ func Dial(
 	qconn, err := tr.Dial(ctx, udpAddr, tlsCfg, &quic.Config{
 		EnableDatagrams: true,
 		KeepAlivePeriod: 10 * time.Second, // must be < CGNAT UDP mapping timeout (~30s)
-		MaxIdleTimeout:  30 * time.Second, // must match server side
+		MaxIdleTimeout:  15 * time.Second, // 1.5x keepalive; detects dead peer within ~15s
 	})
 	if err != nil {
 		return nil, fmt.Errorf("direct: QUIC dial %s: %w", addr, err)
