@@ -673,9 +673,15 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 				"rtt", result.RTT,
 				"generation", msg.Generation,
 			)
-			// Phase 5: client role only — proxy waits for inbound connections.
+			// Client role: promote the path using the same UDP socket as the
+			// probe so CONNECT-IP flows through the already-open NAT entry.
+			// Proxy role: the probe packet was the NAT punch — the proxy is the
+			// server side and waits for the client's inbound CONNECT-IP on the
+			// DirectListener. The probe Transport is no longer needed; close it.
 			if m.mion.Role() == "client" {
 				go m.tryPromotePath(peerID, result)
+			} else {
+				_ = result.Transport.Close()
 			}
 		}()
 	}
