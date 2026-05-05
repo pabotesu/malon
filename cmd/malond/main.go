@@ -77,8 +77,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Create Manager (no global relay URL; each peer carries its own).
-	mgr := manager.New(selfPriv, cfg.Interface.InsecureSkipVerify, mionInst)
+	// Create Manager. cfg.Interface.Relay is used by proxy-role nodes to connect
+	// to the relay and receive incoming sessions from clients.
+	mgr := manager.New(selfPriv, cfg.Interface.Relay, cfg.Interface.InsecureSkipVerify, mionInst)
 
 	// Register peers into both mion and manager.
 	for _, pc := range cfg.Peers {

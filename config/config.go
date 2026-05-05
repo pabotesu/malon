@@ -47,6 +47,7 @@ type InterfaceConfig struct {
 	Address            netip.Prefix // TUN アドレス (e.g. 100.100.0.1/24)
 	Role               string       // "client" or "proxy" (default: "client")
 	ListenPort         string       // proxy mode: "http3://:443" or "http3://:443, http2://:4443"
+	Relay              string       // relay URL this node connects to (required for proxy role)
 	InsecureSkipVerify bool         // skip relay TLS cert verification (testing only)
 }
 
@@ -140,6 +141,8 @@ func parseInterfaceField(iface *InterfaceConfig, key, val string) error {
 		iface.Role = lower
 	case "ListenPort":
 		iface.ListenPort = val // proxy mode; parsed in main.go with parseMionListenEndpoints
+	case "Relay":
+		iface.Relay = val
 	case "InsecureSkipVerify":
 		iface.InsecureSkipVerify = strings.ToLower(val) == "true"
 	default:

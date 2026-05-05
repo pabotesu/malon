@@ -52,16 +52,17 @@ type Manager struct {
 // New creates a Manager.
 //
 //   - selfPriv: local Ed25519 private key (used to derive selfID and for inner mTLS).
+//   - interfaceRelayURL: relay this node connects to regardless of peer config (proxy role).
 //   - tlsInsecure: skip TLS certificate verification on the relay connection (testing only).
 //   - m: the Mion instance; used to activate TUN forwarding after SetConn.
-func New(selfPriv ed25519.PrivateKey, tlsInsecure bool, m *mionpkg.Mion) *Manager {
+func New(selfPriv ed25519.PrivateKey, interfaceRelayURL string, tlsInsecure bool, m *mionpkg.Mion) *Manager {
 	pub := selfPriv.Public().(ed25519.PublicKey)
 	selfID := identity.PeerIDFromPublicKey(pub)
 
 	controlCh := make(chan h2proxy.ControlMessage, 64)
 	acceptCh := make(chan *h2proxy.EnvelopeNetConn, 16)
 
-	return &Manager{
+	mgr := &Manager{
 		selfID:    selfID,
 		selfPriv:  selfPriv,
 		insecure:  tlsInsecure,
@@ -71,6 +72,11 @@ func New(selfPriv ed25519.PrivateKey, tlsInsecure bool, m *mionpkg.Mion) *Manage
 		acceptCh:  acceptCh,
 		mion:      m,
 	}
+	// proxy-role: pre-create the relay proxy so Run() can connect to it.
+	if interfaceRelayURL != "" {
+		mgr.getOrCreateProxy(interfaceRelayURL)
+	}
+	return mgr
 }
 
 // getOrCreateProxy returns the InternalProxy for the given relay URL,
@@ -129,7 +135,7 @@ func (m *Manager) Run(ctx context.Context) error {
 	m.proxyMu.Unlock()
 
 	if len(entries) == 0 {
-		// Proxy-role: no outbound relay connections; just wait for context.
+		// No relay configured at all; just wait for context.
 		<-ctx.Done()
 		return nil
 	}
