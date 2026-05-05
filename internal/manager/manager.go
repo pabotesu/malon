@@ -341,9 +341,11 @@ func (m *Manager) connectPeerWithCtx(ctx context.Context, peerID identity.PeerID
 	proxy := m.getOrCreateProxy(entry.relayURL)
 	envConn := proxy.NewSession(peerID)
 
-	// Use a 10s timeout for the inner mTLS handshake so we don't hang
+	// Use a 3s timeout for the inner mTLS handshake so we don't hang
 	// indefinitely when the remote peer is not yet connected to the relay.
-	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// 3s is ample for a local or nearby relay; retryConnectPeer will retry
+	// with backoff if it fails, so a shorter timeout converges faster.
+	handshakeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 
 	// Inner mTLS: this node is the TLS client (outbound connection).
@@ -682,8 +684,9 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 	m.mu.RLock()
 	entry, ok := m.peers[peerID]
 	h3Addrs := append([]netip.AddrPort(nil), entry.h3Addrs...)
+	alreadyDirect := entry.hasDirectPath
 	m.mu.RUnlock()
-	if !ok {
+	if !ok || alreadyDirect {
 		return
 	}
 
@@ -715,6 +718,18 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 		return
 	}
 
+	// Re-check hasDirectPath under Lock after Dial (another goroutine may
+	// have promoted the path while we were dialling).
+	m.mu.Lock()
+	e, ok2 := m.peers[peerID]
+	if !ok2 || e.hasDirectPath {
+		m.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	e.hasDirectPath = true
+	m.mu.Unlock()
+
 	entry.peer.SetConn(conn)
 	go m.forwardDirectConnToTUN(peerID, entry.peer, conn)
 	slog.Info("manager: promoted to direct path",
@@ -722,12 +737,6 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 		"addr", proxyAddr,
 		"rtt", result.RTT,
 	)
-
-	m.mu.Lock()
-	if e, ok := m.peers[peerID]; ok {
-		e.hasDirectPath = true
-	}
-	m.mu.Unlock()
 }
 
 // forwardDirectConnToTUN reads IP packets from a direct connection and writes
