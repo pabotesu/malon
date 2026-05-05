@@ -441,15 +441,18 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 
 	all := append(embedded, stunned...)
 
-	// Proxy role: advertise the mion h3 endpoint so the client knows which
+	// Proxy role only: advertise the mion h3 endpoint so the client knows which
 	// port to connect to for CONNECT-IP after probe succeeds.
-	if h3port := m.mion.ListenPort(); h3port > 0 {
-		h3Candidates, err := candidate.CollectEmbedded(uint16(h3port), gen, []netip.Prefix{m.overlayPrefix})
-		if err == nil {
-			for i := range h3Candidates {
-				h3Candidates[i].Kind = candidate.KindH3Proxy
+	// Client role does not have an h3 server, so h3proxy candidates are omitted.
+	if m.mion.Role() == "proxy" {
+		if h3port := m.mion.ListenPort(); h3port > 0 {
+			h3Candidates, err := candidate.CollectEmbedded(uint16(h3port), gen, []netip.Prefix{m.overlayPrefix})
+			if err == nil {
+				for i := range h3Candidates {
+					h3Candidates[i].Kind = candidate.KindH3Proxy
+				}
+				all = append(all, h3Candidates...)
 			}
-			all = append(all, h3Candidates...)
 		}
 	}
 
@@ -531,8 +534,10 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 				"rtt", result.RTT,
 				"generation", msg.Generation,
 			)
-			// Phase 5: attempt path promotion using the validated address.
-			go m.tryPromotePath(peerID, result)
+			// Phase 5: client role only — proxy waits for inbound connections.
+			if m.mion.Role() == "client" {
+				go m.tryPromotePath(peerID, result)
+			}
 		}()
 	}
 }
