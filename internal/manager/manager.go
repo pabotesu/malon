@@ -295,17 +295,20 @@ func (m *Manager) relayConnectLoop(ctx context.Context, relayURL string, proxy *
 // It resets per-peer direct-path state so probes run immediately with the new
 // relay session — without waiting for QUIC keepalive to detect a stale path.
 func (m *Manager) setupRelayPeers(ctx context.Context, relayURL string) {
-	// Reset direct-path state for all peers on this relay before dialling.
-	// The remote peer (e.g. proxy) may have restarted; its QUIC endpoint and
-	// DirectListener port may have changed. Clearing hasDirectPath allows
-	// validateCandidates to run probes immediately on the new candidates.
+	// Clear only the stale relay conn reference. Do NOT reset hasDirectPath:
+	// the direct QUIC P2P connection is independent of the relay and remains
+	// alive even when the relay flaps. Clearing hasDirectPath would cause
+	// retryConnectPeer → connectPeerWithCtx → peer.SetConn(relayConn) to
+	// overwrite a perfectly valid P2P path with a relay path, which then
+	// confuses the proxy (its hasDirectPath is still true) and breaks promotion.
+	// When P2P actually fails, forwardDirectConnToTUN → fallbackToRelay resets
+	// hasDirectPath and re-establishes the relay session at that time.
 	m.mu.Lock()
 	var ids []identity.PeerID
 	for id, entry := range m.peers {
 		if entry.relayURL == relayURL {
 			ids = append(ids, id)
-			entry.hasDirectPath = false
-			entry.relayConn = nil // clear stale conn so retryConnectPeer retries
+			entry.relayConn = nil // clear dead relay conn reference
 		}
 	}
 	m.mu.Unlock()
