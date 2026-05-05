@@ -113,6 +113,18 @@ func main() {
 		}
 	}()
 
+	// mion の client 初期化（m.client = c）が完了してから Manager を起動する。
+	// これにより StartForwardConnToTUN が m.client == nil で空振りするのを防ぐ。
+	select {
+	case <-mionInst.ClientReady():
+		slog.Info("malond: mion client ready, starting manager")
+	case <-ctx.Done():
+		return
+	case err := <-errCh:
+		slog.Error("malond: mion startup failed", "err", err)
+		os.Exit(1)
+	}
+
 	go func() {
 		if err := mgr.Run(ctx); err != nil {
 			errCh <- err
