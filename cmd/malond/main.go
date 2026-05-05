@@ -115,15 +115,29 @@ func main() {
 		}
 	}()
 
-	// mion の client 初期化完了を待ってから Manager を起動する。
-	select {
-	case <-mionInst.ClientReady():
-		slog.Info("malond: mion client ready, starting manager")
-	case <-ctx.Done():
-		return
-	case err := <-errCh:
-		slog.Error("malond: mion startup failed", "err", err)
-		os.Exit(1)
+	// proxy ロールでは ClientReady() は永遠に発火しないため、
+	// mion の起動エラーだけを短時間待ってから Manager を起動する。
+	if cfg.Interface.Role == "proxy" {
+		select {
+		case err := <-errCh:
+			slog.Error("malond: mion startup failed", "err", err)
+			os.Exit(1)
+		case <-ctx.Done():
+			return
+		default:
+			slog.Info("malond: proxy role, starting manager without waiting for client ready")
+		}
+	} else {
+		// client ロール: mion の client 初期化完了を待ってから Manager を起動する。
+		select {
+		case <-mionInst.ClientReady():
+			slog.Info("malond: mion client ready, starting manager")
+		case <-ctx.Done():
+			return
+		case err := <-errCh:
+			slog.Error("malond: mion startup failed", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	go func() {
