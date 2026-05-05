@@ -35,33 +35,18 @@ func New() *Relay {
 
 // ListenAndServe starts the Relay on the given address with TLS.
 func (r *Relay) ListenAndServe(addr, certFile, keyFile string) error {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return fmt.Errorf("relay: load TLS keypair: %w", err)
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: http.HandlerFunc(r.handleHTTP),
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS13,
+		},
 	}
-
-	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{"h2"},
-		MinVersion:   tls.VersionTLS13,
-	}
-
-	ln, err := tls.Listen("tcp", addr, tlsCfg)
-	if err != nil {
-		return fmt.Errorf("relay: listen %s: %w", addr, err)
+	if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {
+		return fmt.Errorf("relay: configure http2: %w", err)
 	}
 	slog.Info("relay: listening", "addr", addr)
-
-	srv := &http2.Server{}
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return fmt.Errorf("relay: accept: %w", err)
-		}
-		go srv.ServeConn(conn, &http2.ServeConnOpts{
-			Handler: http.HandlerFunc(r.handleHTTP),
-		})
-	}
+	return srv.ListenAndServeTLS(certFile, keyFile)
 }
 
 // handleHTTP routes CONNECT requests to handleConnect and rejects others.
@@ -150,14 +135,11 @@ func (r *Relay) forward(env envelope.Envelope) error {
 
 // Serve は net.Listener を受け取って TLS なしで動かす（テスト用）。
 func (r *Relay) Serve(ln net.Listener) error {
-	srv := &http2.Server{}
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return err
-		}
-		go srv.ServeConn(conn, &http2.ServeConnOpts{
-			Handler: http.HandlerFunc(r.handleHTTP),
-		})
+	srv := &http.Server{
+		Handler: http.HandlerFunc(r.handleHTTP),
 	}
+	if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {
+		return fmt.Errorf("relay: configure http2: %w", err)
+	}
+	return srv.Serve(ln)
 }
