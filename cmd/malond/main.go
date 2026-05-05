@@ -91,7 +91,6 @@ func main() {
 			PublicKey:  pub,
 			AllowedIPs: allowedIPs,
 		}
-		// PeerID is derived from the public key inside AddPeer.
 		if err := mionInst.AddPeer(p); err != nil {
 			slog.Error("failed to add peer to mion", "err", err)
 			os.Exit(1)
