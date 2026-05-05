@@ -1,6 +1,7 @@
 package h2proxy
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -44,16 +45,16 @@ func NewRelayTunnelConn(envConn *EnvelopeNetConn) *RelayTunnelConn {
 //   - isClient: true → tls.Client (outbound); false → tls.Server (inbound)
 //   - tlsCfg: must be built by auth.NewClientTLSConfig or auth.NewServerTLSConfig
 //
-// The TLS handshake is performed synchronously. On success, CONTROL capsule
-// frames are delivered via RelayTunnelConn.ReadControl.
-func NewRelayTunnelConnWithMTLS(envConn *EnvelopeNetConn, tlsCfg *tls.Config, isClient bool) (*RelayTunnelConn, error) {
+// The TLS handshake is performed synchronously within ctx. On success, CONTROL
+// capsule frames are delivered via RelayTunnelConn.ReadControl.
+func NewRelayTunnelConnWithMTLS(ctx context.Context, envConn *EnvelopeNetConn, tlsCfg *tls.Config, isClient bool) (*RelayTunnelConn, error) {
 	var tlsConn *tls.Conn
 	if isClient {
 		tlsConn = tls.Client(envConn, tlsCfg)
 	} else {
 		tlsConn = tls.Server(envConn, tlsCfg)
 	}
-	if err := tlsConn.Handshake(); err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("h2proxy: inner mTLS handshake: %w", err)
 	}
 	ctrlCh := make(chan []byte, 16)

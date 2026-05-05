@@ -322,6 +322,12 @@ func (m *Manager) setupRelayPeers(ctx context.Context, relayURL string) {
 // ConnectPeer opens a Relay-H2 session to peerID, performs inner mTLS
 // as the client side, and calls SetConn on the corresponding mion peer.Peer.
 func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
+	return m.connectPeerWithCtx(m.ctx, peerID)
+}
+
+// connectPeerWithCtx is the internal implementation of ConnectPeer.
+// ctx controls the inner mTLS handshake timeout.
+func (m *Manager) connectPeerWithCtx(ctx context.Context, peerID identity.PeerID) error {
 	m.mu.RLock()
 	entry, ok := m.peers[peerID]
 	m.mu.RUnlock()
@@ -335,13 +341,18 @@ func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
 	proxy := m.getOrCreateProxy(entry.relayURL)
 	envConn := proxy.NewSession(peerID)
 
+	// Use a 10s timeout for the inner mTLS handshake so we don't hang
+	// indefinitely when the remote peer is not yet connected to the relay.
+	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
 	// Inner mTLS: this node is the TLS client (outbound connection).
 	tlsCfg, err := auth.NewClientTLSConfig(m.selfPriv, m.knownPeerSet())
 	if err != nil {
 		envConn.Close()
 		return fmt.Errorf("manager: build client TLS config: %w", err)
 	}
-	relayConn, err := h2proxy.NewRelayTunnelConnWithMTLS(envConn, tlsCfg, true)
+	relayConn, err := h2proxy.NewRelayTunnelConnWithMTLS(handshakeCtx, envConn, tlsCfg, true)
 	if err != nil {
 		envConn.Close()
 		return fmt.Errorf("manager: inner mTLS handshake (client): %w", err)
@@ -416,7 +427,9 @@ func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 		envConn.Close()
 		return
 	}
-	relayConn, err := h2proxy.NewRelayTunnelConnWithMTLS(envConn, tlsCfg, false)
+	handshakeCtx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+	defer cancel()
+	relayConn, err := h2proxy.NewRelayTunnelConnWithMTLS(handshakeCtx, envConn, tlsCfg, false)
 	if err != nil {
 		slog.Error("manager: inner mTLS handshake (server)", "peer_id", peerID, "err", err)
 		envConn.Close()
@@ -758,6 +771,11 @@ func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
 	entry, ok := m.peers[peerID]
 	var oldRelayConn *h2proxy.RelayTunnelConn
 	if ok {
+		if !entry.hasDirectPath {
+			// Another goroutine already triggered fallback; skip.
+			m.mu.Unlock()
+			return
+		}
 		entry.hasDirectPath = false
 		oldRelayConn = entry.relayConn
 		entry.relayConn = nil // clear so ConnectPeer will set a fresh one
@@ -781,13 +799,44 @@ func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
 		return
 	}
 
-	// Re-establish a fresh relay session with a fresh inner mTLS handshake so the
-	// proxy always sees a proper TLS ClientHello at session start.
-	if err := m.ConnectPeer(peerID); err != nil {
-		slog.Warn("manager: fallback relay re-connect failed", "peer_id", peerID, "err", err)
-		return
+	// Retry ConnectPeer in the background with backoff. The remote proxy may
+	// not be connected to the relay yet (e.g. proxy just restarted), so a
+	// single attempt is not enough.
+	go m.retryConnectPeer(peerID)
+}
+
+// retryConnectPeer keeps trying to establish a relay session to peerID until
+// it succeeds, the context is cancelled, or a direct path is promoted again.
+func (m *Manager) retryConnectPeer(peerID identity.PeerID) {
+	backoff := time.Second
+	const maxBackoff = 15 * time.Second
+	for {
+		if m.ctx.Err() != nil {
+			return
+		}
+		// Stop retrying if a new direct path has already been promoted.
+		m.mu.RLock()
+		alreadyDirect := m.peers[peerID] != nil && m.peers[peerID].hasDirectPath
+		m.mu.RUnlock()
+		if alreadyDirect {
+			return
+		}
+		if err := m.connectPeerWithCtx(m.ctx, peerID); err == nil {
+			slog.Info("manager: restored relay path after direct path failure", "peer_id", peerID)
+			return
+		} else {
+			slog.Warn("manager: relay re-connect attempt failed, retrying",
+				"peer_id", peerID, "err", err, "backoff", backoff)
+		}
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
 	}
-	slog.Info("manager: restored relay path after direct path failure", "peer_id", peerID)
 }
 
 // forwardConnToTUN reads IP packets from a relay tunnel and writes them to
