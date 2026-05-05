@@ -35,6 +35,7 @@ type peerEntry struct {
 	relayURL      string
 	relayConn     *h2proxy.RelayTunnelConn // current relay conn; used for fallback after direct path breaks
 	hasDirectPath bool                     // true while a direct CONNECT-IP path is active
+	retryingConn  bool                     // true while retryConnectPeer goroutine is running
 }
 
 // Manager coordinates transport paths for all known peers.
@@ -315,7 +316,16 @@ func (m *Manager) setupRelayPeers(ctx context.Context, relayURL string) {
 		// proxy not yet connected to the relay when client starts first) does
 		// not block other peers. retryConnectPeer polls until the relay session
 		// is available and the mTLS handshake succeeds.
-		go m.retryConnectPeer(id)
+		// Prevent duplicate goroutines: skip if one is already running.
+		m.mu.Lock()
+		entry := m.peers[id]
+		if entry != nil && !entry.retryingConn {
+			entry.retryingConn = true
+			m.mu.Unlock()
+			go m.retryConnectPeer(id)
+		} else {
+			m.mu.Unlock()
+		}
 	}
 }
 
@@ -878,6 +888,17 @@ func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
 		return
 	}
 
+	// Prevent duplicate retryConnectPeer goroutines. A goroutine may already be
+	// running from setupRelayPeers (relay reconnect) or a previous fallback.
+	m.mu.Lock()
+	if entry, ok := m.peers[peerID]; ok && entry.retryingConn {
+		m.mu.Unlock()
+		return
+	} else if ok {
+		entry.retryingConn = true
+	}
+	m.mu.Unlock()
+
 	// Retry ConnectPeer in the background with backoff. The remote proxy may
 	// not be connected to the relay yet (e.g. proxy just restarted), so a
 	// single attempt is not enough.
@@ -887,6 +908,13 @@ func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
 // retryConnectPeer keeps trying to establish a relay session to peerID until
 // it succeeds, the context is cancelled, or a direct path is promoted again.
 func (m *Manager) retryConnectPeer(peerID identity.PeerID) {
+	defer func() {
+		m.mu.Lock()
+		if e := m.peers[peerID]; e != nil {
+			e.retryingConn = false
+		}
+		m.mu.Unlock()
+	}()
 	backoff := time.Second
 	const maxBackoff = 15 * time.Second
 	for {
