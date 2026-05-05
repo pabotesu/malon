@@ -106,6 +106,16 @@ func (l *Listener) LocalPort() uint16 {
 	return l.localPort
 }
 
+// Transport returns the underlying *quic.Transport (shared UDP socket).
+// Callers use this to send outgoing probes and CONNECT-IP connections from
+// the same port that inbound connections arrive on, which is essential for
+// NAT hole punching: both sides must use the same 4-tuple that the peer is
+// told about via candidates.
+// The transport is owned by the Listener; do NOT call Close() on it.
+func (l *Listener) Transport() *quic.Transport {
+	return l.transport
+}
+
 // Accept waits for the next inbound connection and returns either a
 // *ProbeEvent (ALPN "malon-probe") or *ConnectEvent (ALPN "h3").
 // Invalid connections are silently rejected.

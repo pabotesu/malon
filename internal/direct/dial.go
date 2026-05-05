@@ -19,9 +19,10 @@ import (
 
 // DirectConn wraps a CONNECT-IP session established over a direct QUIC path.
 // It implements the same ReadPacket/WritePacket/Close interface as relay conns.
+// The underlying UDP socket (quic.Transport) is owned by the DirectListener
+// and must NOT be closed here.
 type DirectConn struct {
-	inner     *connectip.Conn
-	transport *quic.Transport // underlying UDP socket; closed when DirectConn closes
+	inner *connectip.Conn
 }
 
 // ReadPacket reads one IP packet from the direct path.
@@ -35,21 +36,19 @@ func (c *DirectConn) WritePacket(pkt []byte) error {
 	return err
 }
 
-// Close terminates the direct CONNECT-IP session and releases the UDP socket.
+// Close terminates the direct CONNECT-IP session.
+// The underlying UDP socket is owned by the DirectListener, not this conn.
 func (c *DirectConn) Close() error {
-	err := c.inner.Close()
-	_ = c.transport.Close()
-	return err
+	return c.inner.Close()
 }
 
-// Dial establishes a direct QUIC + CONNECT-IP session to addr using tr, which
-// is the *quic.Transport returned by h3path.Validator.Probe(). Reusing the
-// same transport (UDP socket / local port) means the CONNECT-IP Initial packet
-// is sent from the exact same (src-IP, src-port) that the probe used, so it
-// hits the NAT entry the probe already opened — enabling hole punching through
-// symmetric NAT, not just cone NAT.
+// Dial establishes a direct QUIC + CONNECT-IP session to addr using tr.
+// tr MUST be the DirectListener's transport (Listener.Transport()) so that
+// both the probe and the CONNECT-IP connection leave from the same UDP port.
+// This ensures the QUIC Initial packet hits the NAT entry opened by the probe,
+// enabling hole punching through symmetric NAT.
 //
-// Ownership of tr transfers to the returned DirectConn; Close() will release it.
+// tr is NOT owned by Dial; the DirectListener manages its lifetime.
 func Dial(
 	ctx context.Context,
 	selfPriv ed25519.PrivateKey,
@@ -89,5 +88,5 @@ func Dial(
 		return nil, fmt.Errorf("direct: CONNECT-IP dial %s: %w", addr, err)
 	}
 
-	return &DirectConn{inner: ipconn, transport: tr}, nil
+	return &DirectConn{inner: ipconn}, nil
 }

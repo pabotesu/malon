@@ -646,16 +646,54 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 		}
 
 		go func() {
-			probeCtx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
-			defer cancel()
-			result, err := m.validator.Probe(probeCtx, addr, peerID)
-			if err != nil {
-				// Record cooldown so the same address is not retried immediately.
+			if m.directLn == nil {
+				return
+			}
+			tr := m.directLn.Transport()
+
+			// Hole-punching retry loop: both sides must send probe packets at
+			// roughly the same time for the NAT entries to be created in both
+			// directions. We retry every second for up to 30 seconds so that
+			// even if the two sides are not perfectly synchronised, they will
+			// eventually punch through each other's NAT.
+			const (
+				perAttemptTimeout = 5 * time.Second
+				retryInterval     = 1 * time.Second
+				totalTimeout      = 30 * time.Second
+			)
+			deadline := time.Now().Add(totalTimeout)
+			var result *h3path.ValidatedTransport
+			var lastErr error
+			for time.Now().Before(deadline) {
+				if m.ctx.Err() != nil {
+					return
+				}
+				m.mu.RLock()
+				already := m.peers[peerID] != nil && m.peers[peerID].hasDirectPath
+				m.mu.RUnlock()
+				if already {
+					return
+				}
+				probeCtx, cancel := context.WithTimeout(m.ctx, perAttemptTimeout)
+				result, lastErr = m.validator.Probe(probeCtx, addr, peerID, tr)
+				cancel()
+				if lastErr == nil {
+					break
+				}
+				slog.Debug("manager: probe attempt failed, retrying",
+					"peer_id", peerID, "addr", addr, "err", lastErr)
+				select {
+				case <-m.ctx.Done():
+					return
+				case <-time.After(retryInterval):
+				}
+			}
+			if lastErr != nil {
 				m.probeCooldownMu.Lock()
 				m.probeCooldown[addr] = time.Now().Add(probeCooldownDur)
 				m.probeCooldownMu.Unlock()
 				slog.Warn("manager: probe failed",
-					"peer_id", peerID, "addr", addr, "kind", ci.Kind, "err", err)
+					"peer_id", peerID, "addr", addr, "kind", ci.Kind, "err", lastErr)
 				return
 			}
 			// Clear cooldown on success so a previously-failing address can be
@@ -673,43 +711,34 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 				"rtt", result.RTT,
 				"generation", msg.Generation,
 			)
-			// Client role: promote the path using the same UDP socket as the
-			// probe so CONNECT-IP flows through the already-open NAT entry.
-			// Proxy role: the probe packet was the NAT punch — the proxy is the
-			// server side and waits for the client's inbound CONNECT-IP on the
-			// DirectListener. The probe Transport is no longer needed; close it.
+			// Client: dial CONNECT-IP from the same DirectListener socket so
+			// the packet hits the NAT entry the probe opened.
+			// Proxy: the probe was our NAT punch — wait for the client's
+			// inbound CONNECT-IP on the DirectListener.
 			if m.mion.Role() == "client" {
 				go m.tryPromotePath(peerID, result)
-			} else {
-				_ = result.Transport.Close()
 			}
 		}()
 	}
 }
 
-// tryPromotePath attempts to promote a validated direct path to the active
-// data path for peerID. It reuses result.Transport (the UDP socket used for
-// the probe) so that CONNECT-IP traffic flows from the exact same local port —
-// hitting the same NAT entry the probe opened. This works through symmetric
-// NAT, not just cone NAT.
-// Ownership of result.Transport is transferred: this function or the returned
-// DirectConn will always close it.
+// tryPromotePath dials CONNECT-IP to result.RemoteAddr using the DirectListener's
+// transport (same UDP socket / port as the probe), so the packet hits the NAT
+// entry the probe opened. tr is owned by the DirectListener and must not be closed.
 func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.ValidatedTransport) {
+	if m.directLn == nil {
+		return
+	}
 	m.mu.RLock()
 	entry, ok := m.peers[peerID]
 	alreadyDirect := entry.hasDirectPath
 	m.mu.RUnlock()
 	if !ok || alreadyDirect {
-		_ = result.Transport.Close()
 		return
 	}
 
-	// Dial CONNECT-IP using the same UDP transport as the probe.
-	// result.Transport ownership passes to direct.Dial (and then to DirectConn).
-	conn, err := direct.Dial(m.ctx, m.selfPriv, result.RemoteAddr, peerID, result.Transport)
+	conn, err := direct.Dial(m.ctx, m.selfPriv, result.RemoteAddr, peerID, m.directLn.Transport())
 	if err != nil {
-		// Transport is NOT closed here — direct.Dial does not take ownership on error.
-		_ = result.Transport.Close()
 		slog.Warn("manager: direct path promotion failed",
 			"peer_id", peerID, "addr", result.RemoteAddr, "err", err)
 		return
@@ -721,7 +750,7 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 	e, ok2 := m.peers[peerID]
 	if !ok2 || e.hasDirectPath {
 		m.mu.Unlock()
-		_ = conn.Close() // also closes result.Transport
+		_ = conn.Close()
 		return
 	}
 	e.hasDirectPath = true
