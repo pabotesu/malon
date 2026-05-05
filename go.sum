@@ -6,6 +6,8 @@ github.com/dunglas/httpsfv v1.0.2 h1:iERDp/YAfnojSDJ7PW3dj1AReJz4MrwbECSSE59JWL0
 github.com/dunglas/httpsfv v1.0.2/go.mod h1:zID2mqw9mFsnt7YC3vYQ9/cjq30q41W+1AnDwH8TiMg=
 github.com/pabotesu/mion v0.0.0-20260505110432-684ba4364644 h1:34a/iM+oeLmh+xM3HfgSPm1bf7X2HQQu9K0W4grMPFw=
 github.com/pabotesu/mion v0.0.0-20260505110432-684ba4364644/go.mod h1:h8aVnba6YNZRvqo53xaX92LUZfUgNfs8SZMPnV1OXEg=
+github.com/pabotesu/mion v0.0.0-20260505152359-40156ac0aabc h1:ZUmklXcZzCJHQFMkfBdvw1fTLLa3ys7SqRmUGizkWrY=
+github.com/pabotesu/mion v0.0.0-20260505152359-40156ac0aabc/go.mod h1:h8aVnba6YNZRvqo53xaX92LUZfUgNfs8SZMPnV1OXEg=
 github.com/pion/dtls/v3 v3.1.2 h1:gqEdOUXLtCGW+afsBLO0LtDD8GnuBBjEy6HRtyofZTc=
 github.com/pion/dtls/v3 v3.1.2/go.mod h1:Hw/igcX4pdY69z1Hgv5x7wJFrUkdgHwAn/Q/uo7YHRo=
 github.com/pion/logging v0.2.4 h1:tTew+7cmQ+Mc1pTBLKH2puKsOvhm32dROumOZ655zB8=

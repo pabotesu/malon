@@ -19,6 +19,7 @@ import (
 	"github.com/pabotesu/malon/internal/auth"
 	"github.com/pabotesu/malon/internal/candidate"
 	"github.com/pabotesu/malon/internal/control"
+	"github.com/pabotesu/malon/internal/direct"
 	"github.com/pabotesu/malon/internal/h2proxy"
 	"github.com/pabotesu/malon/internal/h3path"
 	"github.com/pabotesu/malon/internal/identity"
@@ -67,6 +68,9 @@ type Manager struct {
 
 	validatedMu sync.RWMutex
 	validated   map[identity.PeerID][]*h3path.ValidatedTransport
+
+	// Phase 4+: DirectListener for accepting inbound probes.
+	directLn *direct.Listener
 }
 
 // New creates a Manager.
@@ -144,6 +148,17 @@ func (m *Manager) RegisterPeer(pub ed25519.PublicKey, p *peer.Peer, relayURL str
 // affect peers on other relays. Blocks until ctx is cancelled.
 func (m *Manager) Run(ctx context.Context) error {
 	m.ctx = ctx
+
+	// Start DirectListener for inbound "malon-probe" connections.
+	ln, err := direct.New(m.selfPriv, m.knownPeerSet())
+	if err != nil {
+		slog.Warn("manager: DirectListener failed to start, inbound probes disabled", "err", err)
+	} else {
+		m.directLn = ln
+		slog.Info("manager: DirectListener started", "port", ln.LocalPort())
+		go m.probeAcceptLoop(ctx)
+	}
+
 	go m.acceptLoop(ctx)
 	go m.controlLoop(ctx)
 	go m.autoConnectLoop(ctx)
@@ -257,6 +272,27 @@ func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
 	return nil
 }
 
+// probeAcceptLoop accepts inbound "malon-probe" connections on the DirectListener
+// and records them as validated paths for Phase 5 path promotion.
+func (m *Manager) probeAcceptLoop(ctx context.Context) {
+	defer m.directLn.Close()
+	for {
+		ev, err := m.directLn.Accept(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("manager: DirectListener accept error", "err", err)
+			return
+		}
+		slog.Info("manager: inbound probe accepted", "peer_id", ev.PeerID,
+			"remote", ev.Conn.RemoteAddr())
+		// Close the probe connection immediately — Phase 5 will reuse it for
+		// path promotion once both directions succeed.
+		_ = ev.Conn.CloseWithError(0, "probe ok")
+	}
+}
+
 // acceptLoop handles incoming EnvelopeNetConns (initiated by remote peers).
 func (m *Manager) acceptLoop(ctx context.Context) {
 	for {
@@ -362,11 +398,12 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 
 	gen := m.generation
 
-	// Collect embedded candidates only when we have a fixed listen port
-	// (proxy role). Clients have no stable incoming port yet.
+	// Collect embedded candidates using the DirectListener port.
+	// The DirectListener binds its own UDP socket regardless of role, so both
+	// proxy and client nodes can accept inbound probes on a known port.
 	var embedded []candidate.Candidate
-	port := uint16(m.mion.ListenPort())
-	if port > 0 {
+	if m.directLn != nil {
+		port := m.directLn.LocalPort()
 		var err error
 		embedded, err = candidate.CollectEmbedded(port, gen)
 		if err != nil {

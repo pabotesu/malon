@@ -15,7 +15,10 @@ import (
 	"github.com/pabotesu/malon/internal/identity"
 )
 
-const alpnMalonRelay = "malon-relay"
+const (
+	alpnMalonRelay = "malon-relay"
+	alpnMalonProbe = "malon-probe"
+)
 
 // NewClientTLSConfig returns a *tls.Config for the initiating side of the
 // inner mTLS handshake (relay client / outbound connection).
@@ -60,7 +63,7 @@ func NewServerTLSConfig(
 }
 
 // NewProbeClientTLSConfig returns a TLS config for DirectH3 path probe
-// connections to a peer's mion proxy listener (ALPN "h3").
+// connections to a peer's DirectListener (ALPN "malon-probe").
 // The probe verifies that the remote cert belongs to expectedPeerID.
 func NewProbeClientTLSConfig(
 	selfPriv ed25519.PrivateKey,
@@ -75,7 +78,28 @@ func NewProbeClientTLSConfig(
 		Certificates:          []tls.Certificate{cert},
 		InsecureSkipVerify:    true, //nolint:gosec
 		MinVersion:            tls.VersionTLS13,
-		NextProtos:            []string{"h3"},
+		NextProtos:            []string{alpnMalonProbe},
+		VerifyPeerCertificate: makePeerVerifier(knownPeers),
+	}, nil
+}
+
+// NewProbeServerTLSConfig returns a TLS config for the DirectListener server
+// side (ALPN "malon-probe"). Inbound probe connections must present a
+// certificate from a known peer.
+func NewProbeServerTLSConfig(
+	selfPriv ed25519.PrivateKey,
+	knownPeers map[identity.PeerID]struct{},
+) (*tls.Config, error) {
+	cert, err := selfCert(selfPriv)
+	if err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		Certificates:          []tls.Certificate{cert},
+		ClientAuth:            tls.RequireAnyClientCert,
+		InsecureSkipVerify:    true, //nolint:gosec
+		MinVersion:            tls.VersionTLS13,
+		NextProtos:            []string{alpnMalonProbe},
 		VerifyPeerCertificate: makePeerVerifier(knownPeers),
 	}, nil
 }
