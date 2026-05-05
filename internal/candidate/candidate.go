@@ -13,6 +13,7 @@ type Kind uint8
 const (
 	KindEmbedded Kind = 0 // local network interface address
 	KindStuned   Kind = 1 // STUN-observed external address
+	KindH3Proxy  Kind = 2 // mion proxy h3 endpoint (proxy role only)
 )
 
 // String returns the wire name of the Kind.
@@ -22,6 +23,8 @@ func (k Kind) String() string {
 		return "embedded"
 	case KindStuned:
 		return "stuned"
+	case KindH3Proxy:
+		return "h3proxy"
 	default:
 		return "unknown"
 	}

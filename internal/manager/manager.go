@@ -33,6 +33,7 @@ import (
 type peerEntry struct {
 	peer     *peer.Peer
 	relayURL string
+	h3Addrs  []netip.AddrPort // mion h3 endpoints received via h3proxy candidates
 }
 
 // Manager coordinates transport paths for all known peers.
@@ -439,6 +440,19 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 	}
 
 	all := append(embedded, stunned...)
+
+	// Proxy role: advertise the mion h3 endpoint so the client knows which
+	// port to connect to for CONNECT-IP after probe succeeds.
+	if h3port := m.mion.ListenPort(); h3port > 0 {
+		h3Candidates, err := candidate.CollectEmbedded(uint16(h3port), gen, []netip.Prefix{m.overlayPrefix})
+		if err == nil {
+			for i := range h3Candidates {
+				h3Candidates[i].Kind = candidate.KindH3Proxy
+			}
+			all = append(all, h3Candidates...)
+		}
+	}
+
 	if len(all) == 0 {
 		return
 	}
@@ -489,6 +503,15 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 			slog.Warn("manager: invalid candidate addr", "addr", ci.Addr, "err", err)
 			continue
 		}
+		// h3proxy candidates are not probed; they are stored for use in path promotion.
+		if ci.Kind == candidate.KindH3Proxy.String() {
+			m.mu.Lock()
+			if entry, ok := m.peers[peerID]; ok {
+				entry.h3Addrs = append(entry.h3Addrs, addr)
+			}
+			m.mu.Unlock()
+			continue
+		}
 		go func() {
 			probeCtx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
 			defer cancel()
@@ -518,28 +541,32 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 // data path for peerID. Only client-role nodes dial out; proxy-role nodes
 // wait for the client to connect via mion's h3 listener.
 //
-// The direct CONNECT-IP session is established to the peer's mion proxy h3
-// endpoint (peer.Peer.Endpoint), which is already reachable because the
-// probe to result.RemoteAddr succeeded — both are on the same host.
+// The direct CONNECT-IP session is established to the peer's mion h3 endpoint
+// advertised via h3proxy candidates. We pick the h3proxy address whose host
+// matches the validated probe address, ensuring we use the same reachable path.
 func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.ValidatedTransport) {
 	m.mu.RLock()
 	entry, ok := m.peers[peerID]
+	h3Addrs := append([]netip.AddrPort(nil), entry.h3Addrs...)
 	m.mu.RUnlock()
 	if !ok {
 		return
 	}
-	p := entry.peer
 
-	// Only the client role dials out. Proxy role accepts inbound connections
-	// from the client via mion's existing h3 listener — no action needed here.
-	if !p.Endpoint.IsValid() {
+	// Find a h3proxy address whose host matches the validated probe host.
+	probeHost := result.RemoteAddr.Addr()
+	var proxyAddr netip.AddrPort
+	for _, a := range h3Addrs {
+		if a.Addr() == probeHost {
+			proxyAddr = a
+			break
+		}
+	}
+	if !proxyAddr.IsValid() {
+		slog.Debug("manager: no h3proxy candidate matches validated probe host, skipping promotion",
+			"peer_id", peerID, "probe_host", probeHost)
 		return
 	}
-
-	// Use the validated address host with the peer's configured proxy port.
-	// The probe verified reachability to result.RemoteAddr (DirectListener port).
-	// The actual CONNECT-IP session goes to the mion proxy h3 port on the same host.
-	proxyAddr := netip.AddrPortFrom(result.RemoteAddr.Addr(), p.Endpoint.Port())
 
 	dialCtx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
 	defer cancel()
@@ -551,8 +578,8 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 		return
 	}
 
-	p.SetConn(conn)
-	go m.forwardDirectConnToTUN(p, conn)
+	entry.peer.SetConn(conn)
+	go m.forwardDirectConnToTUN(entry.peer, conn)
 	slog.Info("manager: promoted to direct path",
 		"peer_id", peerID,
 		"addr", proxyAddr,
