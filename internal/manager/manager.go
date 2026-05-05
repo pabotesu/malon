@@ -35,7 +35,9 @@ type peerEntry struct {
 }
 
 // Manager coordinates transport paths for all known peers.
-const defaultSTUNServer = "stun.l.google.com:19302"
+// defaultSTUNServer uses the IPv4-only subdomain provided by Google to avoid
+// silent failures on hosts that have IPv6 configured but no working IPv6 route.
+const defaultSTUNServer = "stun4.l.google.com:19302"
 
 type Manager struct {
 	selfID     identity.PeerID
