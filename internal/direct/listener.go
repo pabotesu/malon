@@ -31,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"time"
 
 	connectip "github.com/quic-go/connect-ip-go"
 	"github.com/quic-go/quic-go"
@@ -85,7 +86,10 @@ func New(selfPriv ed25519.PrivateKey, knownPeers map[identity.PeerID]struct{}) (
 	}
 
 	tr := &quic.Transport{Conn: udpConn}
-	ln, err := tr.Listen(tlsCfg, &quic.Config{EnableDatagrams: true})
+	ln, err := tr.Listen(tlsCfg, &quic.Config{
+		EnableDatagrams: true,
+		MaxIdleTimeout:  30 * time.Second, // must match client side
+	})
 	if err != nil {
 		_ = tr.Close()
 		return nil, fmt.Errorf("direct: listen QUIC: %w", err)

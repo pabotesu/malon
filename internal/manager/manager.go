@@ -262,6 +262,7 @@ func (m *Manager) relayConnectLoop(ctx context.Context, relayURL string, proxy *
 		m.probeCooldownMu.Lock()
 		m.probeCooldown = make(map[netip.AddrPort]time.Time)
 		m.probeCooldownMu.Unlock()
+
 		m.setupRelayPeers(ctx, relayURL)
 		backoff = time.Second // reset backoff on success
 
@@ -303,17 +304,18 @@ func (m *Manager) setupRelayPeers(ctx context.Context, relayURL string) {
 		if entry.relayURL == relayURL {
 			ids = append(ids, id)
 			entry.hasDirectPath = false
+			entry.relayConn = nil // clear stale conn so retryConnectPeer retries
 		}
 	}
 	m.mu.Unlock()
 
 	for _, id := range ids {
-		if ctx.Err() != nil {
-			return
-		}
-		if err := m.ConnectPeer(id); err != nil {
-			slog.Warn("manager: peer connect failed after relay reconnect", "peer_id", id, "err", err)
-		}
+		id := id
+		// Launch a retry goroutine per peer so that a slow/absent peer (e.g.
+		// proxy not yet connected to the relay when client starts first) does
+		// not block other peers. retryConnectPeer polls until the relay session
+		// is available and the mTLS handshake succeeds.
+		go m.retryConnectPeer(id)
 	}
 }
 
@@ -359,8 +361,15 @@ func (m *Manager) connectPeerWithCtx(ctx context.Context, peerID identity.PeerID
 	}
 
 	m.mu.Lock()
+	oldRelayConn := entry.relayConn // close old session before starting new one
 	entry.relayConn = relayConn
 	m.mu.Unlock()
+
+	// Closing the old relayConn stops its goroutines so their writes don't
+	// race with the new TLS handshake on the relay stream.
+	if oldRelayConn != nil {
+		_ = oldRelayConn.Close()
+	}
 
 	entry.peer.SetConn(relayConn)
 	go m.forwardConnToTUN(entry.peer, relayConn)
@@ -471,8 +480,16 @@ func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 	}
 
 	m.mu.Lock()
+	oldRelayConn := entry.relayConn // close old session before starting new one
 	entry.relayConn = relayConn
 	m.mu.Unlock()
+
+	// Closing the old relayConn stops its forwardConnToTUN, sendCandidates, and
+	// controlReadLoop goroutines immediately. This prevents their writes from
+	// racing with the new TLS handshake on the relay stream.
+	if oldRelayConn != nil {
+		_ = oldRelayConn.Close()
+	}
 
 	entry.peer.SetConn(relayConn)
 	go m.forwardConnToTUN(entry.peer, relayConn)
