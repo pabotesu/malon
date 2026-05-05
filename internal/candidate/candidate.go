@@ -48,7 +48,8 @@ type Candidate struct {
 
 // CollectEmbedded returns all non-loopback, non-link-local unicast IPs on
 // local interfaces paired with port, as embedded candidates.
-func CollectEmbedded(port uint16, generation uint32) ([]Candidate, error) {
+// exclude is a list of prefixes to skip (e.g. the MALON overlay prefix).
+func CollectEmbedded(port uint16, generation uint32, exclude []netip.Prefix) ([]Candidate, error) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
@@ -78,6 +79,9 @@ func CollectEmbedded(port uint16, generation uint32) ([]Candidate, error) {
 				continue
 			}
 			addr = addr.Unmap()
+			if containedIn(addr, exclude) {
+				continue
+			}
 			out = append(out, Candidate{
 				Kind:       KindEmbedded,
 				Addr:       netip.AddrPortFrom(addr, port),
@@ -87,4 +91,14 @@ func CollectEmbedded(port uint16, generation uint32) ([]Candidate, error) {
 		}
 	}
 	return out, nil
+}
+
+// containedIn reports whether addr falls within any of the given prefixes.
+func containedIn(addr netip.Addr, prefixes []netip.Prefix) bool {
+	for _, p := range prefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }

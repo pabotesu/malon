@@ -70,7 +70,8 @@ type Manager struct {
 	validated   map[identity.PeerID][]*h3path.ValidatedTransport
 
 	// Phase 4+: DirectListener for accepting inbound probes.
-	directLn *direct.Listener
+	directLn      *direct.Listener
+	overlayPrefix netip.Prefix // MALON overlay prefix; excluded from embedded candidates
 }
 
 // New creates a Manager.
@@ -79,8 +80,10 @@ type Manager struct {
 //   - interfaceRelayURL: relay this node connects to regardless of peer config (proxy role).
 //   - tlsInsecure: skip TLS certificate verification on the relay connection (testing only).
 //   - stunServer: STUN server (host:port); empty string uses the default (stun.l.google.com:19302).
+//   - overlayPrefix: the MALON overlay prefix (e.g. 100.100.100.0/24); its addresses are
+//     excluded from embedded candidates since they are virtual and not reachable directly.
 //   - m: the Mion instance; used to activate TUN forwarding after SetConn.
-func New(selfPriv ed25519.PrivateKey, interfaceRelayURL string, tlsInsecure bool, stunServer string, m *mionpkg.Mion) *Manager {
+func New(selfPriv ed25519.PrivateKey, interfaceRelayURL string, tlsInsecure bool, stunServer string, overlayPrefix netip.Prefix, m *mionpkg.Mion) *Manager {
 	pub := selfPriv.Public().(ed25519.PublicKey)
 	selfID := identity.PeerIDFromPublicKey(pub)
 
@@ -88,18 +91,19 @@ func New(selfPriv ed25519.PrivateKey, interfaceRelayURL string, tlsInsecure bool
 	acceptCh := make(chan *h2proxy.EnvelopeNetConn, 16)
 
 	mgr := &Manager{
-		selfID:     selfID,
-		selfPriv:   selfPriv,
-		insecure:   tlsInsecure,
-		stunServer: stunServer,
-		peers:      make(map[identity.PeerID]*peerEntry),
-		proxies:    make(map[string]*h2proxy.InternalProxy),
-		controlCh:  controlCh,
-		acceptCh:   acceptCh,
-		mion:       m,
-		validator:  h3path.New(selfPriv),
-		generation: 1,
-		validated:  make(map[identity.PeerID][]*h3path.ValidatedTransport),
+		selfID:        selfID,
+		selfPriv:      selfPriv,
+		insecure:      tlsInsecure,
+		stunServer:    stunServer,
+		peers:         make(map[identity.PeerID]*peerEntry),
+		proxies:       make(map[string]*h2proxy.InternalProxy),
+		controlCh:     controlCh,
+		acceptCh:      acceptCh,
+		mion:          m,
+		validator:     h3path.New(selfPriv),
+		generation:    1,
+		validated:     make(map[identity.PeerID][]*h3path.ValidatedTransport),
+		overlayPrefix: overlayPrefix,
 	}
 	// proxy-role: pre-create the relay proxy so Run() can connect to it.
 	if interfaceRelayURL != "" {
@@ -404,8 +408,12 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 	var embedded []candidate.Candidate
 	if m.directLn != nil {
 		port := m.directLn.LocalPort()
+		var exclude []netip.Prefix
+		if m.overlayPrefix.IsValid() {
+			exclude = []netip.Prefix{m.overlayPrefix}
+		}
 		var err error
-		embedded, err = candidate.CollectEmbedded(port, gen)
+		embedded, err = candidate.CollectEmbedded(port, gen, exclude)
 		if err != nil {
 			slog.Warn("manager: collect embedded candidates failed", "err", err)
 		}
