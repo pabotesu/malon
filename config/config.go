@@ -49,6 +49,7 @@ type InterfaceConfig struct {
 	ListenPort         string       // proxy mode: "http3://:443" or "http3://:443, http2://:4443"
 	Relay              string       // relay URL this node connects to (required for proxy role)
 	InsecureSkipVerify bool         // skip relay TLS cert verification (testing only)
+	STUNServer         string       // STUN server address (host:port); defaults to stun.l.google.com:19302
 }
 
 // PeerConfig は [Peer] セクションを表す。
@@ -145,6 +146,8 @@ func parseInterfaceField(iface *InterfaceConfig, key, val string) error {
 		iface.Relay = val
 	case "InsecureSkipVerify":
 		iface.InsecureSkipVerify = strings.ToLower(val) == "true"
+	case "STUNServer":
+		iface.STUNServer = val
 	default:
 		return fmt.Errorf("config: unknown Interface key %q", key)
 	}

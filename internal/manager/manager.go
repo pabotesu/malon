@@ -35,10 +35,13 @@ type peerEntry struct {
 }
 
 // Manager coordinates transport paths for all known peers.
+const defaultSTUNServer = "stun.l.google.com:19302"
+
 type Manager struct {
-	selfID   identity.PeerID
-	selfPriv ed25519.PrivateKey
-	insecure bool // skip relay TLS cert verification (testing only)
+	selfID     identity.PeerID
+	selfPriv   ed25519.PrivateKey
+	insecure   bool   // skip relay TLS cert verification (testing only)
+	stunServer string // STUN server address (host:port)
 
 	mu    sync.RWMutex
 	peers map[identity.PeerID]*peerEntry // malon PeerID → peer + relay URL
@@ -67,8 +70,9 @@ type Manager struct {
 //   - selfPriv: local Ed25519 private key (used to derive selfID and for inner mTLS).
 //   - interfaceRelayURL: relay this node connects to regardless of peer config (proxy role).
 //   - tlsInsecure: skip TLS certificate verification on the relay connection (testing only).
+//   - stunServer: STUN server (host:port); empty string uses the default (stun.l.google.com:19302).
 //   - m: the Mion instance; used to activate TUN forwarding after SetConn.
-func New(selfPriv ed25519.PrivateKey, interfaceRelayURL string, tlsInsecure bool, m *mionpkg.Mion) *Manager {
+func New(selfPriv ed25519.PrivateKey, interfaceRelayURL string, tlsInsecure bool, stunServer string, m *mionpkg.Mion) *Manager {
 	pub := selfPriv.Public().(ed25519.PublicKey)
 	selfID := identity.PeerIDFromPublicKey(pub)
 
@@ -79,6 +83,7 @@ func New(selfPriv ed25519.PrivateKey, interfaceRelayURL string, tlsInsecure bool
 		selfID:     selfID,
 		selfPriv:   selfPriv,
 		insecure:   tlsInsecure,
+		stunServer: stunServer,
 		peers:      make(map[identity.PeerID]*peerEntry),
 		proxies:    make(map[string]*h2proxy.InternalProxy),
 		controlCh:  controlCh,
@@ -364,7 +369,11 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 	// Collect stuned candidate via STUN.
 	stunCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	stunAddr, err := stun.Query(stunCtx, "stun.l.google.com:19302")
+	srv := m.stunServer
+	if srv == "" {
+		srv = defaultSTUNServer
+	}
+	stunAddr, err := stun.Query(stunCtx, srv)
 	var stunned []candidate.Candidate
 	if err != nil {
 		slog.Debug("manager: STUN query failed", "err", err)

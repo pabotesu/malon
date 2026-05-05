@@ -79,7 +79,7 @@ func main() {
 
 	// Create Manager. cfg.Interface.Relay is used by proxy-role nodes to connect
 	// to the relay and receive incoming sessions from clients.
-	mgr := manager.New(selfPriv, cfg.Interface.Relay, cfg.Interface.InsecureSkipVerify, mionInst)
+	mgr := manager.New(selfPriv, cfg.Interface.Relay, cfg.Interface.InsecureSkipVerify, cfg.Interface.STUNServer, mionInst)
 
 	// Register peers into both mion and manager.
 	for _, pc := range cfg.Peers {
