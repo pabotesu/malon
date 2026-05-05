@@ -508,7 +508,88 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 				"rtt", result.RTT,
 				"generation", msg.Generation,
 			)
+			// Phase 5: attempt path promotion using the validated address.
+			go m.tryPromotePath(peerID, result)
 		}()
+	}
+}
+
+// tryPromotePath attempts to promote a validated direct path to the active
+// data path for peerID. Only client-role nodes dial out; proxy-role nodes
+// wait for the client to connect via mion's h3 listener.
+//
+// The direct CONNECT-IP session is established to the peer's mion proxy h3
+// endpoint (peer.Peer.Endpoint), which is already reachable because the
+// probe to result.RemoteAddr succeeded — both are on the same host.
+func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.ValidatedTransport) {
+	m.mu.RLock()
+	entry, ok := m.peers[peerID]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	p := entry.peer
+
+	// Only the client role dials out. Proxy role accepts inbound connections
+	// from the client via mion's existing h3 listener — no action needed here.
+	if !p.Endpoint.IsValid() {
+		return
+	}
+
+	// Use the validated address host with the peer's configured proxy port.
+	// The probe verified reachability to result.RemoteAddr (DirectListener port).
+	// The actual CONNECT-IP session goes to the mion proxy h3 port on the same host.
+	proxyAddr := netip.AddrPortFrom(result.RemoteAddr.Addr(), p.Endpoint.Port())
+
+	dialCtx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+	defer cancel()
+
+	conn, err := direct.Dial(dialCtx, m.selfPriv, proxyAddr, peerID)
+	if err != nil {
+		slog.Warn("manager: direct path promotion failed",
+			"peer_id", peerID, "addr", proxyAddr, "err", err)
+		return
+	}
+
+	p.SetConn(conn)
+	go m.forwardDirectConnToTUN(p, conn)
+	slog.Info("manager: promoted to direct path",
+		"peer_id", peerID,
+		"addr", proxyAddr,
+		"rtt", result.RTT,
+	)
+}
+
+// forwardDirectConnToTUN reads IP packets from a direct connection and writes
+// them to TUN. Mirrors forwardConnToTUN but for *direct.DirectConn.
+func (m *Manager) forwardDirectConnToTUN(p *peer.Peer, dc *direct.DirectConn) {
+	if m.mion == nil {
+		return
+	}
+	tun := m.mion.TUN()
+	buf := make([]byte, tun.MTU())
+	for {
+		n, err := dc.ReadPacket(buf)
+		if err != nil {
+			p.ClearConnIf(dc)
+			slog.Debug("manager: direct conn closed (conn→TUN)", "peer_id", p.PeerID, "err", err)
+			return
+		}
+		if n == 0 {
+			p.UpdateLastReceive()
+			continue
+		}
+		pkt := buf[:n]
+		p.UpdateLastReceive()
+		srcIP := malonExtractSrcIP(pkt)
+		if !malonAllowedIPsContains(p.AllowedIPs, srcIP) {
+			slog.Warn("manager: dropping packet on direct path, src not in AllowedIPs",
+				"peer_id", p.PeerID, "src", srcIP)
+			continue
+		}
+		if _, err := tun.Write(pkt); err != nil {
+			slog.Error("manager: TUN write error (direct)", "err", err)
+		}
 	}
 }
 

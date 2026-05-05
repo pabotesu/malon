@@ -83,6 +83,27 @@ func NewProbeClientTLSConfig(
 	}, nil
 }
 
+// NewDirectClientTLSConfig returns a TLS config for establishing a direct
+// CONNECT-IP session to a peer's mion proxy h3 endpoint (ALPN "h3").
+// Used by Phase 5 path promotion after a probe has succeeded.
+func NewDirectClientTLSConfig(
+	selfPriv ed25519.PrivateKey,
+	expectedPeerID identity.PeerID,
+) (*tls.Config, error) {
+	cert, err := selfCert(selfPriv)
+	if err != nil {
+		return nil, err
+	}
+	knownPeers := map[identity.PeerID]struct{}{expectedPeerID: {}}
+	return &tls.Config{
+		Certificates:          []tls.Certificate{cert},
+		InsecureSkipVerify:    true, //nolint:gosec
+		MinVersion:            tls.VersionTLS13,
+		NextProtos:            []string{"h3"},
+		VerifyPeerCertificate: makePeerVerifier(knownPeers),
+	}, nil
+}
+
 // NewProbeServerTLSConfig returns a TLS config for the DirectListener server
 // side (ALPN "malon-probe"). Inbound probe connections must present a
 // certificate from a known peer.
