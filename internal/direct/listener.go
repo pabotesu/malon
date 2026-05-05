@@ -175,13 +175,17 @@ func (l *Listener) handleConnect(conn *quic.Conn) (*ConnectEvent, error) {
 		err    error
 	}
 	ch := make(chan result, 1)
-	template := uritemplate.MustNew("https://ignored/mion")
 	prxy := &connectip.Proxy{}
 
 	h3srv := &http3.Server{
 		EnableDatagrams: true,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			req, parseErr := connectip.ParseRequest(r, template)
+			// Build the template from the incoming :authority header so that
+			// ParseRequest's host-equality check always passes. The client sends
+			// its view of our address (e.g. the NAT-mapped external IP:port), which
+			// differs from our locally bound address and cannot be known in advance.
+			tmpl := uritemplate.MustNew("https://" + r.Host + "/mion")
+			req, parseErr := connectip.ParseRequest(r, tmpl)
 			if parseErr != nil {
 				var rpe *connectip.RequestParseError
 				status := http.StatusBadRequest
