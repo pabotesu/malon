@@ -59,6 +59,27 @@ func NewServerTLSConfig(
 	}, nil
 }
 
+// NewProbeClientTLSConfig returns a TLS config for DirectH3 path probe
+// connections to a peer's mion proxy listener (ALPN "h3").
+// The probe verifies that the remote cert belongs to expectedPeerID.
+func NewProbeClientTLSConfig(
+	selfPriv ed25519.PrivateKey,
+	expectedPeerID identity.PeerID,
+) (*tls.Config, error) {
+	cert, err := selfCert(selfPriv)
+	if err != nil {
+		return nil, err
+	}
+	knownPeers := map[identity.PeerID]struct{}{expectedPeerID: {}}
+	return &tls.Config{
+		Certificates:          []tls.Certificate{cert},
+		InsecureSkipVerify:    true, //nolint:gosec
+		MinVersion:            tls.VersionTLS13,
+		NextProtos:            []string{"h3"},
+		VerifyPeerCertificate: makePeerVerifier(knownPeers),
+	}, nil
+}
+
 // selfCert builds a tls.Certificate from the node's Ed25519 private key.
 func selfCert(priv ed25519.PrivateKey) (tls.Certificate, error) {
 	_, certDER, err := identity.SelfSignedCert(priv)

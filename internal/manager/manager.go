@@ -14,10 +14,15 @@ import (
 	"log/slog"
 	"net/netip"
 	"sync"
+	"time"
 
 	"github.com/pabotesu/malon/internal/auth"
+	"github.com/pabotesu/malon/internal/candidate"
+	"github.com/pabotesu/malon/internal/control"
 	"github.com/pabotesu/malon/internal/h2proxy"
+	"github.com/pabotesu/malon/internal/h3path"
 	"github.com/pabotesu/malon/internal/identity"
+	"github.com/pabotesu/malon/internal/stun"
 	mionpkg "github.com/pabotesu/mion/mion"
 	"github.com/pabotesu/mion/peer"
 )
@@ -48,6 +53,13 @@ type Manager struct {
 
 	mion *mionpkg.Mion
 	ctx  context.Context // set when Run is called
+
+	// Phase 4: DirectH3PathValidator
+	validator  *h3path.Validator
+	generation uint32 // current network generation (Phase 6 will manage transitions)
+
+	validatedMu sync.RWMutex
+	validated   map[identity.PeerID][]*h3path.ValidatedTransport
 }
 
 // New creates a Manager.
@@ -64,14 +76,17 @@ func New(selfPriv ed25519.PrivateKey, interfaceRelayURL string, tlsInsecure bool
 	acceptCh := make(chan *h2proxy.EnvelopeNetConn, 16)
 
 	mgr := &Manager{
-		selfID:    selfID,
-		selfPriv:  selfPriv,
-		insecure:  tlsInsecure,
-		peers:     make(map[identity.PeerID]*peerEntry),
-		proxies:   make(map[string]*h2proxy.InternalProxy),
-		controlCh: controlCh,
-		acceptCh:  acceptCh,
-		mion:      m,
+		selfID:     selfID,
+		selfPriv:   selfPriv,
+		insecure:   tlsInsecure,
+		peers:      make(map[identity.PeerID]*peerEntry),
+		proxies:    make(map[string]*h2proxy.InternalProxy),
+		controlCh:  controlCh,
+		acceptCh:   acceptCh,
+		mion:       m,
+		validator:  h3path.New(selfPriv),
+		generation: 1,
+		validated:  make(map[identity.PeerID][]*h3path.ValidatedTransport),
 	}
 	// proxy-role: pre-create the relay proxy so Run() can connect to it.
 	if interfaceRelayURL != "" {
@@ -227,6 +242,7 @@ func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
 
 	entry.peer.SetConn(relayConn)
 	go m.forwardConnToTUN(entry.peer, relayConn)
+	go m.sendCandidates(peerID, relayConn)
 	go m.controlReadLoop(peerID, relayConn)
 	slog.Info("manager: relay tunnel established (inner mTLS)", "peer_id", peerID)
 	return nil
@@ -277,6 +293,7 @@ func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 
 	entry.peer.SetConn(relayConn)
 	go m.forwardConnToTUN(entry.peer, relayConn)
+	go m.sendCandidates(peerID, relayConn)
 	go m.controlReadLoop(peerID, relayConn)
 	slog.Info("manager: incoming relay tunnel accepted (inner mTLS)", "peer_id", peerID)
 }
@@ -311,8 +328,117 @@ func (m *Manager) controlLoop(ctx context.Context) {
 }
 
 func (m *Manager) handleControl(msg h2proxy.ControlMessage) {
-	// M4 以降で candidate / PathState の処理を追加する。
-	slog.Debug("manager: control message received", "src", msg.SrcPeerID, "len", len(msg.Payload))
+	ctrlMsg, err := control.Decode(msg.Payload)
+	if err != nil {
+		slog.Debug("manager: control decode failed", "src", msg.SrcPeerID, "err", err)
+		return
+	}
+	switch ctrlMsg.Type {
+	case control.MsgTypeCandidates:
+		go m.validateCandidates(msg.SrcPeerID, ctrlMsg)
+	default:
+		slog.Debug("manager: unknown control type", "src", msg.SrcPeerID, "type", ctrlMsg.Type)
+	}
+}
+
+// sendCandidates collects embedded and stuned candidates for this node and
+// sends them to the given peer via a CONTROL capsule. Only proxy-role nodes
+// (those with a mion listener port > 0) advertise candidates.
+func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnelConn) {
+	if m.mion == nil || m.mion.Role() != "proxy" {
+		return
+	}
+	port := uint16(m.mion.ListenPort())
+	if port == 0 {
+		return
+	}
+
+	gen := m.generation
+
+	// Collect embedded candidates (local interface IPs + listen port).
+	embedded, err := candidate.CollectEmbedded(port, gen)
+	if err != nil {
+		slog.Warn("manager: collect embedded candidates failed", "err", err)
+	}
+
+	// Collect stuned candidate via STUN.
+	stunCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stunAddr, err := stun.Query(stunCtx, "stun.l.google.com:19302")
+	var stunned []candidate.Candidate
+	if err != nil {
+		slog.Debug("manager: STUN query failed", "err", err)
+	} else {
+		stunned = []candidate.Candidate{{
+			Kind:       candidate.KindStuned,
+			Addr:       stunAddr,
+			Generation: gen,
+		}}
+	}
+
+	all := append(embedded, stunned...)
+	if len(all) == 0 {
+		return
+	}
+
+	var infos []control.CandidateInfo
+	for _, c := range all {
+		infos = append(infos, control.CandidateInfo{
+			Kind: c.Kind.String(),
+			Addr: c.Addr.String(),
+		})
+	}
+	payload, err := control.Encode(control.Message{
+		Type:       control.MsgTypeCandidates,
+		Generation: gen,
+		Candidates: infos,
+	})
+	if err != nil {
+		slog.Error("manager: encode candidate message", "err", err)
+		return
+	}
+	if err := rc.WriteControl(payload); err != nil {
+		slog.Warn("manager: send candidates failed", "peer_id", peerID, "err", err)
+		return
+	}
+	slog.Info("manager: sent candidates", "peer_id", peerID, "count", len(all))
+}
+
+// validateCandidates runs DirectH3PathValidator for each candidate received
+// from a peer. Successful probes are stored in m.validated for Phase 5
+// path promotion.
+func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message) {
+	if m.ctx == nil {
+		return
+	}
+	for _, ci := range msg.Candidates {
+		ci := ci
+		addr, err := netip.ParseAddrPort(ci.Addr)
+		if err != nil {
+			slog.Warn("manager: invalid candidate addr", "addr", ci.Addr, "err", err)
+			continue
+		}
+		go func() {
+			probeCtx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
+			defer cancel()
+			result, err := m.validator.Probe(probeCtx, addr, peerID)
+			if err != nil {
+				slog.Debug("manager: probe failed",
+					"peer_id", peerID, "addr", addr, "kind", ci.Kind, "err", err)
+				return
+			}
+			m.validatedMu.Lock()
+			m.validated[peerID] = append(m.validated[peerID], result)
+			m.validatedMu.Unlock()
+			slog.Info("manager: direct path validated",
+				"peer_id", peerID,
+				"addr", result.RemoteAddr,
+				"kind", ci.Kind,
+				"rtt", result.RTT,
+				"generation", msg.Generation,
+			)
+		}()
+	}
 }
 
 // forwardConnToTUN reads IP packets from a relay tunnel and writes them to
