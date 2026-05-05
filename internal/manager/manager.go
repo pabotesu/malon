@@ -12,6 +12,7 @@ import (
 	"crypto/ed25519"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"sync"
 
 	"github.com/pabotesu/malon/internal/auth"
@@ -225,9 +226,7 @@ func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
 	}
 
 	entry.peer.SetConn(relayConn)
-	if m.mion != nil && m.ctx != nil {
-		m.mion.StartForwardConnToTUN(m.ctx, entry.peer)
-	}
+	go m.forwardConnToTUN(entry.peer, relayConn)
 	go m.controlReadLoop(peerID, relayConn)
 	slog.Info("manager: relay tunnel established (inner mTLS)", "peer_id", peerID)
 	return nil
@@ -277,9 +276,7 @@ func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 	}
 
 	entry.peer.SetConn(relayConn)
-	if m.mion != nil && m.ctx != nil {
-		m.mion.StartForwardConnToTUN(m.ctx, entry.peer)
-	}
+	go m.forwardConnToTUN(entry.peer, relayConn)
 	go m.controlReadLoop(peerID, relayConn)
 	slog.Info("manager: incoming relay tunnel accepted (inner mTLS)", "peer_id", peerID)
 }
@@ -316,6 +313,70 @@ func (m *Manager) controlLoop(ctx context.Context) {
 func (m *Manager) handleControl(msg h2proxy.ControlMessage) {
 	// M4 以降で candidate / PathState の処理を追加する。
 	slog.Debug("manager: control message received", "src", msg.SrcPeerID, "len", len(msg.Payload))
+}
+
+// forwardConnToTUN reads IP packets from a relay tunnel and writes them to
+// the TUN device. This is MALON's own implementation of Conn→TUN forwarding,
+// covering both client and proxy roles without relying on mion internals.
+func (m *Manager) forwardConnToTUN(p *peer.Peer, rc *h2proxy.RelayTunnelConn) {
+	if m.mion == nil {
+		return
+	}
+	tun := m.mion.TUN()
+	buf := make([]byte, tun.MTU())
+	for {
+		n, err := rc.ReadPacket(buf)
+		if err != nil {
+			p.ClearConnIf(rc)
+			slog.Debug("manager: relay conn closed (conn→TUN)", "peer_id", p.PeerID, "err", err)
+			return
+		}
+		// n==0 is a keepalive ping; update liveness timestamp.
+		if n == 0 {
+			p.UpdateLastReceive()
+			continue
+		}
+		pkt := buf[:n]
+		p.UpdateLastReceive()
+
+		// Validate source IP against peer's AllowedIPs.
+		srcIP := malonExtractSrcIP(pkt)
+		if !malonAllowedIPsContains(p.AllowedIPs, srcIP) {
+			slog.Warn("manager: dropping packet, src not in AllowedIPs",
+				"peer_id", p.PeerID, "src", srcIP)
+			continue
+		}
+		if _, err := tun.Write(pkt); err != nil {
+			slog.Error("manager: TUN write error", "err", err)
+		}
+	}
+}
+
+// malonExtractSrcIP extracts the source IP address from an IPv4 or IPv6 packet.
+func malonExtractSrcIP(pkt []byte) netip.Addr {
+	if len(pkt) < 20 {
+		return netip.Addr{}
+	}
+	switch pkt[0] >> 4 {
+	case 4:
+		return netip.AddrFrom4([4]byte(pkt[12:16]))
+	case 6:
+		if len(pkt) < 40 {
+			return netip.Addr{}
+		}
+		return netip.AddrFrom16([16]byte(pkt[8:24]))
+	}
+	return netip.Addr{}
+}
+
+// malonAllowedIPsContains reports whether addr falls within any of the prefixes.
+func malonAllowedIPsContains(prefixes []netip.Prefix, addr netip.Addr) bool {
+	for _, prefix := range prefixes {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // knownPeerSet returns a snapshot of registered peer IDs for use in TLS
