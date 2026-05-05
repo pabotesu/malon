@@ -2,7 +2,7 @@
 //
 // The Transport Manager is the central coordinator:
 //   - Holds a registry of peer.Peer references (received from mion at startup).
-//   - Owns InternalProxy and its shared HTTP/2 CONNECT stream to the Relay.
+//   - Owns per-relay InternalProxy instances and their HTTP/2 CONNECT streams.
 //   - Dispatches CONTROL envelopes to path state updates.
 //   - Calls peer.Peer.SetConn to switch between Relay-H2 and Direct-H3 paths.
 package manager
@@ -21,16 +21,27 @@ import (
 	"github.com/pabotesu/mion/peer"
 )
 
+// peerEntry holds a mion peer and the relay URL used to reach it (empty for
+// proxy-role peers that are reached directly, not through a relay).
+type peerEntry struct {
+	peer     *peer.Peer
+	relayURL string
+}
+
 // Manager coordinates transport paths for all known peers.
 type Manager struct {
 	selfID   identity.PeerID
 	selfPriv ed25519.PrivateKey
-	relayURL string
+	insecure bool // skip relay TLS cert verification (testing only)
 
 	mu    sync.RWMutex
-	peers map[identity.PeerID]*peer.Peer // malon PeerID → mion Peer
+	peers map[identity.PeerID]*peerEntry // malon PeerID → peer + relay URL
 
-	proxy     *h2proxy.InternalProxy
+	// proxies is a pool of InternalProxy instances keyed by relay URL.
+	// Created lazily in RegisterPeer; a single relay URL maps to one proxy.
+	proxyMu sync.Mutex
+	proxies map[string]*h2proxy.InternalProxy
+
 	controlCh chan h2proxy.ControlMessage
 	acceptCh  chan *h2proxy.EnvelopeNetConn
 
@@ -41,92 +52,159 @@ type Manager struct {
 // New creates a Manager.
 //
 //   - selfPriv: local Ed25519 private key (used to derive selfID and for inner mTLS).
-//   - relayURL: e.g. "https://relay.example.com:443".
-//   - tlsInsecure: skip TLS certificate verification (testing only).
+//   - tlsInsecure: skip TLS certificate verification on the relay connection (testing only).
 //   - m: the Mion instance; used to activate TUN forwarding after SetConn.
-func New(selfPriv ed25519.PrivateKey, relayURL string, tlsInsecure bool, m *mionpkg.Mion) *Manager {
+func New(selfPriv ed25519.PrivateKey, tlsInsecure bool, m *mionpkg.Mion) *Manager {
 	pub := selfPriv.Public().(ed25519.PublicKey)
 	selfID := identity.PeerIDFromPublicKey(pub)
 
 	controlCh := make(chan h2proxy.ControlMessage, 64)
 	acceptCh := make(chan *h2proxy.EnvelopeNetConn, 16)
 
-	proxy := h2proxy.NewProxy(selfID, relayURL, controlCh, acceptCh, tlsInsecure)
-
 	return &Manager{
 		selfID:    selfID,
 		selfPriv:  selfPriv,
-		relayURL:  relayURL,
-		peers:     make(map[identity.PeerID]*peer.Peer),
-		proxy:     proxy,
+		insecure:  tlsInsecure,
+		peers:     make(map[identity.PeerID]*peerEntry),
+		proxies:   make(map[string]*h2proxy.InternalProxy),
 		controlCh: controlCh,
 		acceptCh:  acceptCh,
 		mion:      m,
 	}
 }
 
+// getOrCreateProxy returns the InternalProxy for the given relay URL,
+// creating one if it doesn't exist yet.
+func (m *Manager) getOrCreateProxy(relayURL string) *h2proxy.InternalProxy {
+	m.proxyMu.Lock()
+	defer m.proxyMu.Unlock()
+	if p, ok := m.proxies[relayURL]; ok {
+		return p
+	}
+	p := h2proxy.NewProxy(m.selfID, relayURL, m.controlCh, m.acceptCh, m.insecure)
+	m.proxies[relayURL] = p
+	return p
+}
+
 // RegisterPeer registers a mion peer.Peer with MALON.
-// pub is the peer's Ed25519 public key (used to derive its PeerID).
+//   - pub: the peer's Ed25519 public key.
+//   - p: the mion peer object.
+//   - relayURL: the relay endpoint used to reach this peer (empty for proxy-role nodes).
+//
 // Must be called before Run.
-func (m *Manager) RegisterPeer(pub ed25519.PublicKey, p *peer.Peer) error {
+func (m *Manager) RegisterPeer(pub ed25519.PublicKey, p *peer.Peer, relayURL string) error {
 	id := identity.PeerIDFromPublicKey(pub)
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, exists := m.peers[id]; exists {
 		return fmt.Errorf("manager: peer %s already registered", id)
 	}
-	m.peers[id] = p
+	m.peers[id] = &peerEntry{peer: p, relayURL: relayURL}
+	// Pre-create the proxy so it is available before Run.
+	if relayURL != "" {
+		m.getOrCreateProxy(relayURL)
+	}
 	slog.Info("manager: peer registered", "peer_id", id)
 	return nil
 }
 
-// Run connects to the Relay and starts dispatching loops.
-// Blocks until ctx is cancelled or a fatal error occurs.
+// Run connects to all relay proxies and starts dispatching loops.
+// Each relay connection runs independently; a failure in one relay does not
+// affect peers on other relays. Blocks until ctx is cancelled.
 func (m *Manager) Run(ctx context.Context) error {
 	m.ctx = ctx
 	go m.acceptLoop(ctx)
 	go m.controlLoop(ctx)
 	go m.autoConnectLoop(ctx)
 
-	// Connect blocks; caller should retry with back-off.
-	return m.proxy.Connect(ctx)
+	m.proxyMu.Lock()
+	type proxyWithURL struct {
+		url string
+		p   *h2proxy.InternalProxy
+	}
+	var entries []proxyWithURL
+	for url, p := range m.proxies {
+		entries = append(entries, proxyWithURL{url: url, p: p})
+	}
+	m.proxyMu.Unlock()
+
+	if len(entries) == 0 {
+		// Proxy-role: no outbound relay connections; just wait for context.
+		<-ctx.Done()
+		return nil
+	}
+
+	// Each relay connection is independent. A failure is logged but does not
+	// terminate connections to other relays.
+	var wg sync.WaitGroup
+	for _, e := range entries {
+		e := e
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := e.p.Connect(ctx); err != nil && ctx.Err() == nil {
+				slog.Error("manager: relay connection closed", "relay", e.url, "err", err)
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
 }
 
-// autoConnectLoop waits for the relay to become ready, then initiates outbound
-// sessions to all registered peers so that TUN→Relay forwarding is active on
-// both sides without requiring manual intervention.
+// autoConnectLoop waits for each relay proxy to become ready, then initiates
+// outbound sessions to all peers that use that relay.
 func (m *Manager) autoConnectLoop(ctx context.Context) {
-	select {
-	case <-ctx.Done():
-		return
-	case <-m.proxy.Connected():
+	m.proxyMu.Lock()
+	proxies := make(map[string]*h2proxy.InternalProxy, len(m.proxies))
+	for url, p := range m.proxies {
+		proxies[url] = p
 	}
+	m.proxyMu.Unlock()
 
-	m.mu.RLock()
-	peerIDs := make([]identity.PeerID, 0, len(m.peers))
-	for id := range m.peers {
-		peerIDs = append(peerIDs, id)
+	var wg sync.WaitGroup
+	for relayURL, proxy := range proxies {
+		relayURL, proxy := relayURL, proxy
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			case <-proxy.Connected():
+			}
+			m.mu.RLock()
+			var ids []identity.PeerID
+			for id, entry := range m.peers {
+				if entry.relayURL == relayURL {
+					ids = append(ids, id)
+				}
+			}
+			m.mu.RUnlock()
+			for _, id := range ids {
+				if err := m.ConnectPeer(id); err != nil {
+					slog.Warn("manager: auto-connect failed", "peer_id", id, "err", err)
+				}
+			}
+		}()
 	}
-	m.mu.RUnlock()
-
-	for _, id := range peerIDs {
-		if err := m.ConnectPeer(id); err != nil {
-			slog.Warn("manager: auto-connect failed", "peer_id", id, "err", err)
-		}
-	}
+	wg.Wait()
 }
 
 // ConnectPeer opens a Relay-H2 session to peerID, performs inner mTLS
 // as the client side, and calls SetConn on the corresponding mion peer.Peer.
 func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
 	m.mu.RLock()
-	p, ok := m.peers[peerID]
+	entry, ok := m.peers[peerID]
 	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("manager: unknown peer %s", peerID)
 	}
+	if entry.relayURL == "" {
+		return fmt.Errorf("manager: peer %s has no relay URL configured", peerID)
+	}
 
-	envConn := m.proxy.NewSession(peerID)
+	proxy := m.getOrCreateProxy(entry.relayURL)
+	envConn := proxy.NewSession(peerID)
 
 	// Inner mTLS: this node is the TLS client (outbound connection).
 	tlsCfg, err := auth.NewClientTLSConfig(m.selfPriv, m.knownPeerSet())
@@ -140,9 +218,9 @@ func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
 		return fmt.Errorf("manager: inner mTLS handshake (client): %w", err)
 	}
 
-	p.SetConn(relayConn)
+	entry.peer.SetConn(relayConn)
 	if m.mion != nil && m.ctx != nil {
-		m.mion.StartForwardConnToTUN(m.ctx, p)
+		m.mion.StartForwardConnToTUN(m.ctx, entry.peer)
 	}
 	go m.controlReadLoop(peerID, relayConn)
 	slog.Info("manager: relay tunnel established (inner mTLS)", "peer_id", peerID)
@@ -170,7 +248,7 @@ func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 	peerID := envConn.PeerID()
 
 	m.mu.RLock()
-	p, ok := m.peers[peerID]
+	entry, ok := m.peers[peerID]
 	m.mu.RUnlock()
 	if !ok {
 		slog.Warn("manager: incoming session from unknown peer, closing", "peer_id", peerID)
@@ -192,9 +270,9 @@ func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 		return
 	}
 
-	p.SetConn(relayConn)
+	entry.peer.SetConn(relayConn)
 	if m.mion != nil && m.ctx != nil {
-		m.mion.StartForwardConnToTUN(m.ctx, p)
+		m.mion.StartForwardConnToTUN(m.ctx, entry.peer)
 	}
 	go m.controlReadLoop(peerID, relayConn)
 	slog.Info("manager: incoming relay tunnel accepted (inner mTLS)", "peer_id", peerID)
