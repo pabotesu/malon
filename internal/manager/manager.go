@@ -44,6 +44,12 @@ type peerEntry struct {
 // unblocked on VPS/firewall environments than Google's alternative port 19302.
 const defaultSTUNServer = "stun4.l.google.com:3478"
 
+// probeCooldownDur is the minimum interval before retrying a probe to an
+// address that previously timed out. This prevents repeated probing of
+// unreachable candidates (e.g. IPv6-only hosts, asymmetric NAT) on every
+// relay reconnect.
+const probeCooldownDur = 3 * time.Minute
+
 type Manager struct {
 	selfID     identity.PeerID
 	selfPriv   ed25519.PrivateKey
@@ -70,6 +76,11 @@ type Manager struct {
 
 	validatedMu sync.RWMutex
 	validated   map[identity.PeerID][]*h3path.ValidatedTransport
+
+	// probeCooldown tracks addresses that recently failed probing.
+	// Entries are evicted after probeCooldownDur to allow retry on network change.
+	probeCooldownMu sync.Mutex
+	probeCooldown   map[netip.AddrPort]time.Time
 
 	// Phase 4+: DirectListener for accepting inbound probes.
 	directLn      *direct.Listener
@@ -105,6 +116,7 @@ func New(selfPriv ed25519.PrivateKey, interfaceRelayURL string, tlsInsecure bool
 		validator:     h3path.New(selfPriv),
 		generation:    1,
 		validated:     make(map[identity.PeerID][]*h3path.ValidatedTransport),
+		probeCooldown: make(map[netip.AddrPort]time.Time),
 		overlayPrefix: overlayPrefix,
 	}
 	// proxy-role: pre-create the relay proxy so Run() can connect to it.
@@ -242,10 +254,14 @@ func (m *Manager) relayConnectLoop(ctx context.Context, relayURL string, proxy *
 			// Successfully established CONNECT stream.
 		}
 
-		// Connected: bump network generation and set up peer sessions.
+		// Connected: bump network generation and clear probe cooldowns so
+		// candidates from the new relay session are probed fresh.
 		m.mu.Lock()
 		m.generation++
 		m.mu.Unlock()
+		m.probeCooldownMu.Lock()
+		m.probeCooldown = make(map[netip.AddrPort]time.Time)
+		m.probeCooldownMu.Unlock()
 		m.setupRelayPeers(ctx, relayURL)
 		backoff = time.Second // reset backoff on success
 
@@ -576,15 +592,34 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 			m.mu.Unlock()
 			continue
 		}
+		// Skip addresses that failed recently to avoid repeated timeout spam
+		// on every relay reconnect (e.g. unreachable IPv6, asymmetric NAT).
+		m.probeCooldownMu.Lock()
+		if until, ok := m.probeCooldown[addr]; ok && time.Now().Before(until) {
+			m.probeCooldownMu.Unlock()
+			slog.Debug("manager: skipping probe (cooldown)", "addr", addr, "until", until)
+			continue
+		}
+		m.probeCooldownMu.Unlock()
+
 		go func() {
 			probeCtx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
 			defer cancel()
 			result, err := m.validator.Probe(probeCtx, addr, peerID)
 			if err != nil {
+				// Record cooldown so the same address is not retried immediately.
+				m.probeCooldownMu.Lock()
+				m.probeCooldown[addr] = time.Now().Add(probeCooldownDur)
+				m.probeCooldownMu.Unlock()
 				slog.Warn("manager: probe failed",
 					"peer_id", peerID, "addr", addr, "kind", ci.Kind, "err", err)
 				return
 			}
+			// Clear cooldown on success so a previously-failing address can be
+			// promoted again if the network topology changes.
+			m.probeCooldownMu.Lock()
+			delete(m.probeCooldown, addr)
+			m.probeCooldownMu.Unlock()
 			m.validatedMu.Lock()
 			m.validated[peerID] = append(m.validated[peerID], result)
 			m.validatedMu.Unlock()
