@@ -748,19 +748,37 @@ func (m *Manager) forwardDirectConnToTUN(peerID identity.PeerID, p *peer.Peer, d
 func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
 	m.mu.Lock()
 	entry, ok := m.peers[peerID]
+	var oldRelayConn *h2proxy.RelayTunnelConn
 	if ok {
 		entry.hasDirectPath = false
+		oldRelayConn = entry.relayConn
+		entry.relayConn = nil // clear so ConnectPeer will set a fresh one
 	}
 	m.mu.Unlock()
 	if !ok {
 		return
 	}
-	rc := entry.relayConn
-	if rc == nil {
-		slog.Warn("manager: no relay conn available for fallback", "peer_id", peerID)
+
+	// Close the old relay conn to unblock any goroutine still reading from it.
+	// The old session is stale: the remote peer may have restarted and expects a
+	// fresh TLS ClientHello, not mid-session encrypted data.
+	if oldRelayConn != nil {
+		_ = oldRelayConn.Close()
+	}
+
+	// Only client role re-dials; proxy role waits for the client to reconnect.
+	if m.mion.Role() != "client" {
+		slog.Info("manager: direct path closed (proxy role), waiting for client reconnect",
+			"peer_id", peerID)
 		return
 	}
-	entry.peer.SetConn(rc)
+
+	// Re-establish a fresh relay session with a fresh inner mTLS handshake so the
+	// proxy always sees a proper TLS ClientHello at session start.
+	if err := m.ConnectPeer(peerID); err != nil {
+		slog.Warn("manager: fallback relay re-connect failed", "peer_id", peerID, "err", err)
+		return
+	}
 	slog.Info("manager: restored relay path after direct path failure", "peer_id", peerID)
 }
 
