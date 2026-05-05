@@ -31,9 +31,10 @@ import (
 // peerEntry holds a mion peer and the relay URL used to reach it (empty for
 // proxy-role peers that are reached directly, not through a relay).
 type peerEntry struct {
-	peer     *peer.Peer
-	relayURL string
-	h3Addrs  []netip.AddrPort // mion h3 endpoints received via h3proxy candidates
+	peer      *peer.Peer
+	relayURL  string
+	h3Addrs   []netip.AddrPort         // mion h3 endpoints received via h3proxy candidates
+	relayConn *h2proxy.RelayTunnelConn // current relay conn; used for fallback after direct path breaks
 }
 
 // Manager coordinates transport paths for all known peers.
@@ -166,7 +167,6 @@ func (m *Manager) Run(ctx context.Context) error {
 
 	go m.acceptLoop(ctx)
 	go m.controlLoop(ctx)
-	go m.autoConnectLoop(ctx)
 
 	m.proxyMu.Lock()
 	type proxyWithURL struct {
@@ -185,60 +185,94 @@ func (m *Manager) Run(ctx context.Context) error {
 		return nil
 	}
 
-	// Each relay connection is independent. A failure is logged but does not
-	// terminate connections to other relays.
+	// Each relay runs its own reconnect loop independently.
 	var wg sync.WaitGroup
 	for _, e := range entries {
 		e := e
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := e.p.Connect(ctx); err != nil && ctx.Err() == nil {
-				slog.Error("manager: relay connection closed", "relay", e.url, "err", err)
-			}
+			m.relayConnectLoop(ctx, e.url, e.p)
 		}()
 	}
 	wg.Wait()
 	return nil
 }
 
-// autoConnectLoop waits for each relay proxy to become ready, then initiates
-// outbound sessions to all peers that use that relay.
-func (m *Manager) autoConnectLoop(ctx context.Context) {
-	m.proxyMu.Lock()
-	proxies := make(map[string]*h2proxy.InternalProxy, len(m.proxies))
-	for url, p := range m.proxies {
-		proxies[url] = p
-	}
-	m.proxyMu.Unlock()
+// relayConnectLoop connects to a relay and reconnects with exponential backoff
+// after disconnection. On each successful connect, peer sessions are established
+// and candidates are exchanged.
+func (m *Manager) relayConnectLoop(ctx context.Context, relayURL string, proxy *h2proxy.InternalProxy) {
+	backoff := time.Second
+	const maxBackoff = 30 * time.Second
+	first := true
 
-	var wg sync.WaitGroup
-	for relayURL, proxy := range proxies {
-		relayURL, proxy := relayURL, proxy
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			select {
-			case <-ctx.Done():
+	for {
+		if !first {
+			proxy.Reset()
+		}
+		first = false
+
+		connectDone := make(chan error, 1)
+		go func() { connectDone <- proxy.Connect(ctx) }()
+
+		// Wait until connected or context cancelled.
+		select {
+		case <-ctx.Done():
+			return
+		case <-proxy.Connected():
+		}
+
+		// Connected: bump network generation and set up peer sessions.
+		m.mu.Lock()
+		m.generation++
+		m.mu.Unlock()
+		m.setupRelayPeers(ctx, relayURL)
+		backoff = time.Second // reset backoff on success
+
+		// Wait for disconnection.
+		select {
+		case <-ctx.Done():
+			return
+		case err := <-connectDone:
+			if ctx.Err() != nil {
 				return
-			case <-proxy.Connected():
 			}
-			m.mu.RLock()
-			var ids []identity.PeerID
-			for id, entry := range m.peers {
-				if entry.relayURL == relayURL {
-					ids = append(ids, id)
-				}
-			}
-			m.mu.RUnlock()
-			for _, id := range ids {
-				if err := m.ConnectPeer(id); err != nil {
-					slog.Warn("manager: auto-connect failed", "peer_id", id, "err", err)
-				}
-			}
-		}()
+			slog.Warn("manager: relay disconnected, reconnecting",
+				"relay", relayURL, "err", err, "backoff", backoff)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+		}
 	}
-	wg.Wait()
+}
+
+// setupRelayPeers establishes outbound sessions to all peers that use the given
+// relay. Called after each successful relay reconnect.
+func (m *Manager) setupRelayPeers(ctx context.Context, relayURL string) {
+	m.mu.RLock()
+	var ids []identity.PeerID
+	for id, entry := range m.peers {
+		if entry.relayURL == relayURL {
+			ids = append(ids, id)
+		}
+	}
+	m.mu.RUnlock()
+
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := m.ConnectPeer(id); err != nil {
+			slog.Warn("manager: peer connect failed after relay reconnect", "peer_id", id, "err", err)
+		}
+	}
 }
 
 // ConnectPeer opens a Relay-H2 session to peerID, performs inner mTLS
@@ -268,6 +302,10 @@ func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
 		envConn.Close()
 		return fmt.Errorf("manager: inner mTLS handshake (client): %w", err)
 	}
+
+	m.mu.Lock()
+	entry.relayConn = relayConn
+	m.mu.Unlock()
 
 	entry.peer.SetConn(relayConn)
 	go m.forwardConnToTUN(entry.peer, relayConn)
@@ -340,6 +378,10 @@ func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 		envConn.Close()
 		return
 	}
+
+	m.mu.Lock()
+	entry.relayConn = relayConn
+	m.mu.Unlock()
 
 	entry.peer.SetConn(relayConn)
 	go m.forwardConnToTUN(entry.peer, relayConn)
@@ -584,7 +626,7 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 	}
 
 	entry.peer.SetConn(conn)
-	go m.forwardDirectConnToTUN(entry.peer, conn)
+	go m.forwardDirectConnToTUN(peerID, entry.peer, conn)
 	slog.Info("manager: promoted to direct path",
 		"peer_id", peerID,
 		"addr", proxyAddr,
@@ -594,7 +636,8 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 
 // forwardDirectConnToTUN reads IP packets from a direct connection and writes
 // them to TUN. Mirrors forwardConnToTUN but for *direct.DirectConn.
-func (m *Manager) forwardDirectConnToTUN(p *peer.Peer, dc *direct.DirectConn) {
+// On close, falls back to the relay path if one is available.
+func (m *Manager) forwardDirectConnToTUN(peerID identity.PeerID, p *peer.Peer, dc *direct.DirectConn) {
 	if m.mion == nil {
 		return
 	}
@@ -604,7 +647,9 @@ func (m *Manager) forwardDirectConnToTUN(p *peer.Peer, dc *direct.DirectConn) {
 		n, err := dc.ReadPacket(buf)
 		if err != nil {
 			p.ClearConnIf(dc)
-			slog.Debug("manager: direct conn closed (conn→TUN)", "peer_id", p.PeerID, "err", err)
+			slog.Info("manager: direct conn closed, falling back to relay",
+				"peer_id", p.PeerID, "err", err)
+			m.fallbackToRelay(peerID)
 			return
 		}
 		if n == 0 {
@@ -623,6 +668,25 @@ func (m *Manager) forwardDirectConnToTUN(p *peer.Peer, dc *direct.DirectConn) {
 			slog.Error("manager: TUN write error (direct)", "err", err)
 		}
 	}
+}
+
+// fallbackToRelay restores the relay conn for a peer after the direct path breaks.
+// If no relay conn is stored, the peer will have no active transport until the
+// relay reconnects and re-establishes the session.
+func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
+	m.mu.RLock()
+	entry, ok := m.peers[peerID]
+	m.mu.RUnlock()
+	if !ok {
+		return
+	}
+	rc := entry.relayConn
+	if rc == nil {
+		slog.Warn("manager: no relay conn available for fallback", "peer_id", peerID)
+		return
+	}
+	entry.peer.SetConn(rc)
+	slog.Info("manager: restored relay path after direct path failure", "peer_id", peerID)
 }
 
 // forwardConnToTUN reads IP packets from a relay tunnel and writes them to

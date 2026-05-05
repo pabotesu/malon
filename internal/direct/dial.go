@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"time"
 
 	connectip "github.com/quic-go/connect-ip-go"
 	"github.com/quic-go/quic-go"
@@ -68,6 +69,7 @@ func Dial(
 
 	qconn, err := tr.Dial(ctx, udpAddr, tlsCfg, &quic.Config{
 		EnableDatagrams: true,
+		KeepAlivePeriod: 15 * time.Second,
 	})
 	if err != nil {
 		_ = tr.Close()

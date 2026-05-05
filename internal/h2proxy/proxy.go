@@ -55,8 +55,8 @@ type InternalProxy struct {
 	sessions map[envelope.SessionID]*sessionEntry
 	nextSID  atomic.Uint32
 
-	connectedOnce sync.Once
-	connectedCh   chan struct{} // closed once the CONNECT stream is established
+	connMu      sync.Mutex
+	connectedCh chan struct{} // closed when the CONNECT stream is established; Reset() for each reconnect
 }
 
 // NewProxy creates an InternalProxy.
@@ -81,10 +81,21 @@ func NewProxy(
 	}
 }
 
-// Connected returns a channel that is closed once the relay CONNECT stream is
-// established. Callers can select on this channel to wait for readiness.
+// Reset prepares the InternalProxy for a new Connect attempt by creating a
+// fresh connectedCh. Must be called before each Connect call (except the first).
+func (p *InternalProxy) Reset() {
+	p.connMu.Lock()
+	p.connectedCh = make(chan struct{})
+	p.connMu.Unlock()
+}
+
+// Connected returns a channel that is closed when the current relay CONNECT
+// stream is established. A new channel is issued after each Reset+Connect cycle.
 func (p *InternalProxy) Connected() <-chan struct{} {
-	return p.connectedCh
+	p.connMu.Lock()
+	ch := p.connectedCh
+	p.connMu.Unlock()
+	return ch
 }
 
 // Connect dials the Relay via HTTP/2 CONNECT and starts the readLoop.
@@ -131,8 +142,11 @@ func (p *InternalProxy) Connect(ctx context.Context) error {
 	p.writer = pw
 	p.wrMu.Unlock()
 
-	// Signal waiters (e.g. Manager auto-connect) that the relay is ready.
-	p.connectedOnce.Do(func() { close(p.connectedCh) })
+	// Signal waiters that the relay is ready for this connect attempt.
+	p.connMu.Lock()
+	ch := p.connectedCh
+	p.connMu.Unlock()
+	close(ch)
 
 	slog.Info("h2proxy: connected to relay", "relay", p.relayURL)
 	defer func() {
