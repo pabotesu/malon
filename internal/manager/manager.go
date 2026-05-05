@@ -216,11 +216,30 @@ func (m *Manager) relayConnectLoop(ctx context.Context, relayURL string, proxy *
 		connectDone := make(chan error, 1)
 		go func() { connectDone <- proxy.Connect(ctx) }()
 
-		// Wait until connected or context cancelled.
+		// Wait until connected, connection failed, or context cancelled.
+		// Connect() may return an error before connectedCh is ever closed
+		// (e.g. when the relay is down), so we must select on both.
 		select {
 		case <-ctx.Done():
 			return
+		case err := <-connectDone:
+			// Connect returned before signalling connected — relay is down.
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("manager: relay connect failed, retrying",
+				"relay", relayURL, "err", err, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < maxBackoff {
+				backoff *= 2
+			}
+			continue
 		case <-proxy.Connected():
+			// Successfully established CONNECT stream.
 		}
 
 		// Connected: bump network generation and set up peer sessions.
