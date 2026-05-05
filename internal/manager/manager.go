@@ -418,7 +418,11 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 		slog.Warn("manager: send candidates failed", "peer_id", peerID, "err", err)
 		return
 	}
-	slog.Info("manager: sent candidates", "peer_id", peerID, "count", len(all))
+	addrs := make([]string, len(all))
+	for i, c := range all {
+		addrs[i] = c.Kind.String() + ":" + c.Addr.String()
+	}
+	slog.Info("manager: sent candidates", "peer_id", peerID, "count", len(all), "addrs", addrs)
 }
 
 // validateCandidates runs DirectH3PathValidator for each candidate received
@@ -428,6 +432,11 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 	if m.ctx == nil {
 		return
 	}
+	recvAddrs := make([]string, len(msg.Candidates))
+	for i, ci := range msg.Candidates {
+		recvAddrs[i] = ci.Kind + ":" + ci.Addr
+	}
+	slog.Info("manager: received candidates", "peer_id", peerID, "count", len(msg.Candidates), "addrs", recvAddrs)
 	for _, ci := range msg.Candidates {
 		ci := ci
 		addr, err := netip.ParseAddrPort(ci.Addr)
@@ -440,7 +449,7 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 			defer cancel()
 			result, err := m.validator.Probe(probeCtx, addr, peerID)
 			if err != nil {
-				slog.Debug("manager: probe failed",
+				slog.Warn("manager: probe failed",
 					"peer_id", peerID, "addr", addr, "kind", ci.Kind, "err", err)
 				return
 			}
