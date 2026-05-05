@@ -41,15 +41,16 @@ type Manager struct {
 //
 //   - selfPriv: local Ed25519 private key (used to derive selfID and for inner mTLS).
 //   - relayURL: e.g. "https://relay.example.com:443".
+//   - tlsInsecure: skip TLS certificate verification (testing only).
 //   - m: the Mion instance; used to activate TUN forwarding after SetConn.
-func New(selfPriv ed25519.PrivateKey, relayURL string, m *mionpkg.Mion) *Manager {
+func New(selfPriv ed25519.PrivateKey, relayURL string, tlsInsecure bool, m *mionpkg.Mion) *Manager {
 	pub := selfPriv.Public().(ed25519.PublicKey)
 	selfID := identity.PeerIDFromPublicKey(pub)
 
 	controlCh := make(chan h2proxy.ControlMessage, 64)
 	acceptCh := make(chan *h2proxy.EnvelopeNetConn, 16)
 
-	proxy := h2proxy.NewProxy(selfID, relayURL, controlCh, acceptCh)
+	proxy := h2proxy.NewProxy(selfID, relayURL, controlCh, acceptCh, tlsInsecure)
 
 	return &Manager{
 		selfID:    selfID,

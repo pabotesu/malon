@@ -22,7 +22,8 @@ type SelfConfig struct {
 }
 
 type RelayConfig struct {
-	Endpoint string `toml:"endpoint"` // https://relay.example.com:443
+	Endpoint           string `toml:"endpoint"`             // https://relay.example.com:443
+	InsecureSkipVerify bool   `toml:"insecure_skip_verify"` // skip TLS cert check (testing only)
 }
 
 type STUNConfig struct {

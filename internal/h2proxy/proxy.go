@@ -2,10 +2,12 @@ package h2proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sync"
 	"sync/atomic"
 
@@ -39,8 +41,9 @@ func (s *sessionEntry) closeOnce() {
 //   - wrMu  protects writer (the shared CONNECT stream write end).
 //   - sessMu protects sessions map. Channel sends are done outside sessMu.
 type InternalProxy struct {
-	selfID   identity.PeerID
-	relayURL string // e.g. "https://relay.example.com:443"
+	selfID      identity.PeerID
+	relayURL    string // e.g. "https://relay.example.com:443"
+	tlsInsecure bool   // skip TLS certificate verification (testing only)
 
 	controlCh chan<- ControlMessage // CONTROL envelopes → Transport Manager
 	acceptCh  chan *EnvelopeNetConn // incoming sessions from remote peers
@@ -65,10 +68,12 @@ func NewProxy(
 	relayURL string,
 	controlCh chan<- ControlMessage,
 	acceptCh chan *EnvelopeNetConn,
+	tlsInsecure bool,
 ) *InternalProxy {
 	return &InternalProxy{
 		selfID:      selfID,
 		relayURL:    relayURL,
+		tlsInsecure: tlsInsecure,
 		controlCh:   controlCh,
 		acceptCh:    acceptCh,
 		sessions:    make(map[envelope.SessionID]*sessionEntry),
@@ -86,9 +91,23 @@ func (p *InternalProxy) Connected() <-chan struct{} {
 // It blocks until the connection is closed or ctx is cancelled.
 // The caller should retry with back-off on error.
 func (p *InternalProxy) Connect(ctx context.Context) error {
-	// PoC: plain HTTP/2 (h2c) without TLS. TLS will be added in M3.
-	transport := &http2.Transport{
-		AllowHTTP: true,
+	u, err := url.Parse(p.relayURL)
+	if err != nil {
+		return fmt.Errorf("h2proxy: parse relay URL: %w", err)
+	}
+
+	var transport *http2.Transport
+	if u.Scheme == "https" {
+		transport = &http2.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: p.tlsInsecure, //nolint:gosec // intentional for testing
+				MinVersion:         tls.VersionTLS13,
+			},
+		}
+	} else {
+		transport = &http2.Transport{
+			AllowHTTP: true,
+		}
 	}
 
 	pr, pw := io.Pipe()

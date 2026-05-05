@@ -66,7 +66,7 @@ func main() {
 	}
 
 	// Create Manager.
-	mgr := manager.New(selfPriv, cfg.Relay.Endpoint, mionInst)
+	mgr := manager.New(selfPriv, cfg.Relay.Endpoint, cfg.Relay.InsecureSkipVerify, mionInst)
 
 	// Register peers into both mion and manager.
 	for _, pc := range cfg.Peers {
