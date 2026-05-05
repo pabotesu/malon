@@ -440,10 +440,13 @@ func (m *Manager) handleDirectConnect(e *direct.ConnectEvent) {
 
 	m.mu.Lock()
 	if entry.hasDirectPath {
-		m.mu.Unlock()
-		// Another goroutine already promoted; discard this connection.
-		_ = e.Conn.Close()
-		return
+		// A direct path is already active. Accept the new connection anyway and
+		// replace the old one: the client may have changed networks and the old
+		// QUIC session is silently dead (keepalive timeout not yet expired on
+		// the proxy side). Replacing avoids a stuck state where hasDirectPath
+		// stays true until the 15s QUIC idle timeout fires.
+		slog.Info("manager: replacing existing direct path with new inbound connection",
+			"peer_id", e.PeerID)
 	}
 	entry.hasDirectPath = true
 	m.mu.Unlock()
@@ -870,7 +873,6 @@ func (m *Manager) forwardDirectConnToTUN(peerID identity.PeerID, p *peer.Peer, d
 func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
 	m.mu.Lock()
 	entry, ok := m.peers[peerID]
-	var oldRelayConn *h2proxy.RelayTunnelConn
 	if ok {
 		if !entry.hasDirectPath {
 			// Another goroutine already triggered fallback; skip.
@@ -878,26 +880,40 @@ func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
 			return
 		}
 		entry.hasDirectPath = false
-		oldRelayConn = entry.relayConn
-		entry.relayConn = nil // clear so ConnectPeer will set a fresh one
 	}
 	m.mu.Unlock()
 	if !ok {
 		return
 	}
 
-	// Close the old relay conn to unblock any goroutine still reading from it.
-	// The old session is stale: the remote peer may have restarted and expects a
-	// fresh TLS ClientHello, not mid-session encrypted data.
-	if oldRelayConn != nil {
-		_ = oldRelayConn.Close()
+	// Proxy role: restore the relay conn if still alive, then wait for the
+	// client to re-initiate. Do NOT close the relay conn here — it is the
+	// only path back until handleIncoming receives a new session from the client.
+	if m.mion.Role() != "client" {
+		m.mu.RLock()
+		liveRelayConn := m.peers[peerID].relayConn
+		m.mu.RUnlock()
+		if liveRelayConn != nil {
+			entry.peer.SetConn(liveRelayConn)
+			slog.Info("manager: direct path closed (proxy role), restored relay path",
+				"peer_id", peerID)
+		} else {
+			slog.Info("manager: direct path closed (proxy role), waiting for client reconnect",
+				"peer_id", peerID)
+		}
+		return
 	}
 
-	// Only client role re-dials; proxy role waits for the client to reconnect.
-	if m.mion.Role() != "client" {
-		slog.Info("manager: direct path closed (proxy role), waiting for client reconnect",
-			"peer_id", peerID)
-		return
+	// Client role: close stale relay conn so the new session gets a fresh TLS handshake.
+	m.mu.Lock()
+	var oldRelayConn *h2proxy.RelayTunnelConn
+	if e := m.peers[peerID]; e != nil {
+		oldRelayConn = e.relayConn
+		e.relayConn = nil // clear so ConnectPeer will set a fresh one
+	}
+	m.mu.Unlock()
+	if oldRelayConn != nil {
+		_ = oldRelayConn.Close()
 	}
 
 	// Prevent duplicate retryConnectPeer goroutines. A goroutine may already be
