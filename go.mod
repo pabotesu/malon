@@ -4,7 +4,7 @@ go 1.26.2
 
 require (
 	github.com/BurntSushi/toml v1.6.0
-	github.com/pabotesu/mion v0.0.0-20260505103317-dcfc9075fa45
+	github.com/pabotesu/mion v0.0.0-20260505110432-684ba4364644
 	golang.org/x/net v0.53.0
 )
 
