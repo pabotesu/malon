@@ -5,9 +5,11 @@ package h2proxy
 // RelayTunnelConn.
 //
 // Capsule wire format:
-//   Capsule Type   (QUIC varint, value = 0 for IP_PACKET)
+//   Capsule Type   (QUIC varint)
+//     0 = IP_PACKET  (raw IP packet, forwarded to MION)
+//     1 = CONTROL    (signalling payload, forwarded to Manager via ctrlCh)
 //   Capsule Length (QUIC varint, byte count of payload)
-//   Payload        (raw IP packet bytes)
+//   Payload        (raw bytes)
 
 import (
 	"bufio"
@@ -18,23 +20,29 @@ import (
 
 const (
 	capsuleTypeIPPacket uint64 = 0
+	capsuleTypeControl  uint64 = 1
 	maxCapsuleLen       uint64 = 65536
 )
 
-// capsuleConn provides ReadPacket / WritePacket over any io.ReadWriter
-// using Capsule Protocol framing. Safe for concurrent use.
+// capsuleConn provides ReadPacket / WritePacket / WriteControl over any
+// io.ReadWriter using Capsule Protocol framing. Safe for concurrent use.
+//
+// ctrlCh receives CONTROL capsule payloads. If nil, CONTROL frames are
+// discarded (used when inner mTLS is not active).
 type capsuleConn struct {
-	rd    *bufio.Reader
-	wr    io.Writer
-	wrMu  sync.Mutex
-	close func() error
+	rd     *bufio.Reader
+	wr     io.Writer
+	wrMu   sync.Mutex
+	close  func() error
+	ctrlCh chan<- []byte // CONTROL frames; nil when mTLS is not active
 }
 
-func newCapsuleConn(r io.Reader, w io.Writer, closeFn func() error) *capsuleConn {
+func newCapsuleConn(r io.Reader, w io.Writer, closeFn func() error, ctrlCh chan<- []byte) *capsuleConn {
 	return &capsuleConn{
-		rd:    bufio.NewReaderSize(r, 65536),
-		wr:    w,
-		close: closeFn,
+		rd:     bufio.NewReaderSize(r, 65536),
+		wr:     w,
+		close:  closeFn,
+		ctrlCh: ctrlCh,
 	}
 }
 
@@ -53,8 +61,22 @@ func (c *capsuleConn) ReadPacket(buf []byte) (int, error) {
 		if payloadLen > maxCapsuleLen {
 			return 0, fmt.Errorf("capsule: payload length %d exceeds limit %d", payloadLen, maxCapsuleLen)
 		}
+		if ct == capsuleTypeControl {
+			payload := make([]byte, payloadLen)
+			if _, err := io.ReadFull(c.rd, payload); err != nil {
+				return 0, fmt.Errorf("capsule: read control payload: %w", err)
+			}
+			if c.ctrlCh != nil {
+				select {
+				case c.ctrlCh <- payload:
+				default:
+					// Drop if channel is full.
+				}
+			}
+			continue
+		}
 		if ct != capsuleTypeIPPacket {
-			// Discard unknown capsule types.
+			// Discard unknown capsule types (forward-compatibility).
 			if _, err := io.CopyN(io.Discard, c.rd, int64(payloadLen)); err != nil {
 				return 0, fmt.Errorf("capsule: discard type %d: %w", ct, err)
 			}
@@ -82,6 +104,22 @@ func (c *capsuleConn) WritePacket(pkt []byte) error {
 	}
 	if _, err := c.wr.Write(pkt); err != nil {
 		return fmt.Errorf("capsule: write payload: %w", err)
+	}
+	return nil
+}
+
+// WriteControl frames payload as a CONTROL capsule and writes it to the stream.
+func (c *capsuleConn) WriteControl(payload []byte) error {
+	hdr := appendVarint(nil, capsuleTypeControl)
+	hdr = appendVarint(hdr, uint64(len(payload)))
+
+	c.wrMu.Lock()
+	defer c.wrMu.Unlock()
+	if _, err := c.wr.Write(hdr); err != nil {
+		return fmt.Errorf("capsule: write control header: %w", err)
+	}
+	if _, err := c.wr.Write(payload); err != nil {
+		return fmt.Errorf("capsule: write control payload: %w", err)
 	}
 	return nil
 }

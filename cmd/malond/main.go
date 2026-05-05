@@ -45,11 +45,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build mion.Config (client role — MALON drives the relay connection).
+	// Build mion.Config; role is read from config (default: client).
+	mionRole := mionpkg.RoleClient
+	if cfg.Self.Role == "proxy" {
+		mionRole = mionpkg.RoleProxy
+	}
 	mionCfg := mionpkg.Config{
 		InterfaceName: "mion0",
 		PrivateKey:    selfPriv,
-		Role:          mionpkg.RoleClient,
+		Role:          mionRole,
 	}
 	if cfg.Self.ListenAddr != "" {
 		// Parse the TUN address if specified in config (e.g. "10.0.0.1/24").

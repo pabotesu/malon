@@ -19,6 +19,7 @@ type Config struct {
 type SelfConfig struct {
 	PrivateKey string `toml:"private_key"` // base64 encoded Ed25519 private key
 	ListenAddr string `toml:"listen_addr"`
+	Role       string `toml:"role"` // "client" or "proxy" (default: "client")
 }
 
 type RelayConfig struct {

@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/pabotesu/malon/internal/auth"
 	"github.com/pabotesu/malon/internal/h2proxy"
 	"github.com/pabotesu/malon/internal/identity"
 	mionpkg "github.com/pabotesu/mion/mion"
@@ -115,8 +116,8 @@ func (m *Manager) autoConnectLoop(ctx context.Context) {
 	}
 }
 
-// ConnectPeer opens a Relay-H2 session to peerID and calls SetConn on the
-// corresponding mion peer.Peer.
+// ConnectPeer opens a Relay-H2 session to peerID, performs inner mTLS
+// as the client side, and calls SetConn on the corresponding mion peer.Peer.
 func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
 	m.mu.RLock()
 	p, ok := m.peers[peerID]
@@ -126,12 +127,25 @@ func (m *Manager) ConnectPeer(peerID identity.PeerID) error {
 	}
 
 	envConn := m.proxy.NewSession(peerID)
-	relayConn := h2proxy.NewRelayTunnelConn(envConn)
+
+	// Inner mTLS: this node is the TLS client (outbound connection).
+	tlsCfg, err := auth.NewClientTLSConfig(m.selfPriv, m.knownPeerSet())
+	if err != nil {
+		envConn.Close()
+		return fmt.Errorf("manager: build client TLS config: %w", err)
+	}
+	relayConn, err := h2proxy.NewRelayTunnelConnWithMTLS(envConn, tlsCfg, true)
+	if err != nil {
+		envConn.Close()
+		return fmt.Errorf("manager: inner mTLS handshake (client): %w", err)
+	}
+
 	p.SetConn(relayConn)
 	if m.mion != nil && m.ctx != nil {
 		m.mion.StartForwardConnToTUN(m.ctx, p)
 	}
-	slog.Info("manager: relay tunnel established", "peer_id", peerID)
+	go m.controlReadLoop(peerID, relayConn)
+	slog.Info("manager: relay tunnel established (inner mTLS)", "peer_id", peerID)
 	return nil
 }
 
@@ -150,9 +164,8 @@ func (m *Manager) acceptLoop(ctx context.Context) {
 	}
 }
 
-// handleIncoming sets up a RelayTunnelConn for a remotely-initiated session.
-// In M3 step 1 (no inner mTLS), the session's peerID is taken from the
-// Envelope's src_peer_id (trusted via Relay; replaced by mTLS in step 2).
+// handleIncoming sets up a RelayTunnelConn for a remotely-initiated session,
+// performing inner mTLS as the TLS server side.
 func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 	peerID := envConn.PeerID()
 
@@ -165,15 +178,43 @@ func (m *Manager) handleIncoming(envConn *h2proxy.EnvelopeNetConn) {
 		return
 	}
 
-	relayConn := h2proxy.NewRelayTunnelConn(envConn)
+	// Inner mTLS: this node is the TLS server (inbound connection).
+	tlsCfg, err := auth.NewServerTLSConfig(m.selfPriv, m.knownPeerSet())
+	if err != nil {
+		slog.Error("manager: build server TLS config", "peer_id", peerID, "err", err)
+		envConn.Close()
+		return
+	}
+	relayConn, err := h2proxy.NewRelayTunnelConnWithMTLS(envConn, tlsCfg, false)
+	if err != nil {
+		slog.Error("manager: inner mTLS handshake (server)", "peer_id", peerID, "err", err)
+		envConn.Close()
+		return
+	}
+
 	p.SetConn(relayConn)
 	if m.mion != nil && m.ctx != nil {
 		m.mion.StartForwardConnToTUN(m.ctx, p)
 	}
-	slog.Info("manager: incoming relay tunnel accepted", "peer_id", peerID)
+	go m.controlReadLoop(peerID, relayConn)
+	slog.Info("manager: incoming relay tunnel accepted (inner mTLS)", "peer_id", peerID)
 }
 
-// controlLoop receives CONTROL messages from InternalProxy and dispatches them.
+// controlReadLoop reads CONTROL frames from a per-peer RelayTunnelConn and
+// dispatches them to handleControl. Runs as a goroutine until the conn closes.
+func (m *Manager) controlReadLoop(peerID identity.PeerID, rc *h2proxy.RelayTunnelConn) {
+	for {
+		payload, err := rc.ReadControl()
+		if err != nil {
+			slog.Debug("manager: control read loop ended", "peer_id", peerID, "err", err)
+			return
+		}
+		m.handleControl(h2proxy.ControlMessage{SrcPeerID: peerID, Payload: payload})
+	}
+}
+
+// controlLoop is retained for backward compatibility but is no longer the
+// primary path for CONTROL delivery (superseded by per-peer controlReadLoop).
 func (m *Manager) controlLoop(ctx context.Context) {
 	for {
 		select {
@@ -191,4 +232,16 @@ func (m *Manager) controlLoop(ctx context.Context) {
 func (m *Manager) handleControl(msg h2proxy.ControlMessage) {
 	// M4 以降で candidate / PathState の処理を追加する。
 	slog.Debug("manager: control message received", "src", msg.SrcPeerID, "len", len(msg.Payload))
+}
+
+// knownPeerSet returns a snapshot of registered peer IDs for use in TLS
+// certificate verification.
+func (m *Manager) knownPeerSet() map[identity.PeerID]struct{} {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	set := make(map[identity.PeerID]struct{}, len(m.peers))
+	for id := range m.peers {
+		set[id] = struct{}{}
+	}
+	return set
 }
