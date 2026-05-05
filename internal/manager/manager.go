@@ -578,6 +578,40 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 
 	gen := m.generation
 
+	srv := m.stunServer
+	if srv == "" {
+		srv = defaultSTUNServer
+	}
+
+	// Collect embedded candidates and STUN in parallel to reduce latency.
+	// STUN timeout is 2s: 3 retries × 500ms RTO fits within the budget, and
+	// a shorter deadline converges faster when the STUN server is unreachable.
+	type stunResult struct {
+		cands []candidate.Candidate
+	}
+	stunCh := make(chan stunResult, 1)
+	go func() {
+		stunCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		var sc []candidate.Candidate
+		if m.directLn != nil {
+			stunAddr, err := stun.QueryFromTransport(stunCtx, m.directLn.Transport(), srv)
+			if err != nil {
+				slog.Warn("manager: STUN query failed", "err", err)
+			} else {
+				sc = []candidate.Candidate{{Kind: candidate.KindStuned, Addr: stunAddr, Generation: gen}}
+			}
+		} else {
+			stunAddr, err := stun.Query(stunCtx, srv)
+			if err != nil {
+				slog.Warn("manager: STUN query failed", "err", err)
+			} else {
+				sc = []candidate.Candidate{{Kind: candidate.KindStuned, Addr: stunAddr, Generation: gen}}
+			}
+		}
+		stunCh <- stunResult{cands: sc}
+	}()
+
 	// Collect embedded candidates using the DirectListener port.
 	// The DirectListener binds its own UDP socket regardless of role, so both
 	// proxy and client nodes can accept inbound probes on a known port.
@@ -595,42 +629,7 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 		}
 	}
 
-	// Collect stuned candidate via STUN using the DirectListener's UDP socket.
-	// Using the same socket is mandatory: the XOR-MAPPED-ADDRESS must reflect
-	// the external IP:port of the exact socket peers will probe and connect to.
-	// A separate socket would give a different external port on symmetric NAT,
-	// making the candidate useless for hole punching.
-	stunCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	srv := m.stunServer
-	if srv == "" {
-		srv = defaultSTUNServer
-	}
-	var stunned []candidate.Candidate
-	if m.directLn != nil {
-		stunAddr, err := stun.QueryFromTransport(stunCtx, m.directLn.Transport(), srv)
-		if err != nil {
-			slog.Warn("manager: STUN query failed", "err", err)
-		} else {
-			stunned = []candidate.Candidate{{
-				Kind:       candidate.KindStuned,
-				Addr:       stunAddr,
-				Generation: gen,
-			}}
-		}
-	} else {
-		stunAddr, err := stun.Query(stunCtx, srv)
-		if err != nil {
-			slog.Warn("manager: STUN query failed", "err", err)
-		} else {
-			stunned = []candidate.Candidate{{
-				Kind:       candidate.KindStuned,
-				Addr:       stunAddr,
-				Generation: gen,
-			}}
-		}
-	}
-
+	stunned := (<-stunCh).cands
 	all := append(embedded, stunned...)
 
 	if len(all) == 0 {
