@@ -702,10 +702,13 @@ func (m *Manager) tryPromotePath(peerID identity.PeerID, result *h3path.Validate
 		return
 	}
 
-	dialCtx, cancel := context.WithTimeout(m.ctx, 10*time.Second)
-	defer cancel()
-
-	conn, err := direct.Dial(dialCtx, m.selfPriv, proxyAddr, peerID)
+	// Pass m.ctx (not a timeout-derived context) so that the CONNECT-IP
+	// HTTP/3 request stream lives for the full connection lifetime.
+	// connectip.Dial passes ctx to OpenRequestStream, which ties the stream
+	// to the context — using a timeout context here would cancel the stream
+	// when tryPromotePath returns, immediately closing the direct path.
+	// QUIC has its own internal dial timeout, so no extra timeout is needed.
+	conn, err := direct.Dial(m.ctx, m.selfPriv, proxyAddr, peerID)
 	if err != nil {
 		slog.Warn("manager: direct path promotion failed",
 			"peer_id", peerID, "addr", proxyAddr, "err", err)
