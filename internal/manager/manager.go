@@ -722,8 +722,8 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 			// even if the two sides are not perfectly synchronised, they will
 			// eventually punch through each other's NAT.
 			const (
-				perAttemptTimeout = 5 * time.Second
-				retryInterval     = 1 * time.Second
+				perAttemptTimeout = 2 * time.Second
+				retryInterval     = 200 * time.Millisecond
 				totalTimeout      = 30 * time.Second
 			)
 			deadline := time.Now().Add(totalTimeout)
