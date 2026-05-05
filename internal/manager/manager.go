@@ -310,6 +310,15 @@ func (m *Manager) setupRelayPeers(ctx context.Context, relayURL string) {
 	}
 	m.mu.Unlock()
 
+	// Only client role actively dials outbound relay sessions. Proxy role
+	// waits for the client to connect via handleIncoming. If proxy also calls
+	// connectPeerWithCtx, it creates a second relay stream to the client;
+	// handleIncoming on the client side would then Close() the first conn,
+	// tearing down all goroutines and causing an EOF→fallback→retry loop.
+	if m.mion == nil || m.mion.Role() != "client" {
+		return
+	}
+
 	for _, id := range ids {
 		id := id
 		// Launch a retry goroutine per peer so that a slow/absent peer (e.g.
@@ -907,6 +916,7 @@ func (m *Manager) fallbackToRelay(peerID identity.PeerID) {
 
 // retryConnectPeer keeps trying to establish a relay session to peerID until
 // it succeeds, the context is cancelled, or a direct path is promoted again.
+// Must only be called from client role — proxy role waits for handleIncoming.
 func (m *Manager) retryConnectPeer(peerID identity.PeerID) {
 	defer func() {
 		m.mu.Lock()
@@ -915,6 +925,10 @@ func (m *Manager) retryConnectPeer(peerID identity.PeerID) {
 		}
 		m.mu.Unlock()
 	}()
+	// Defense-in-depth: ensure proxy never dials outbound.
+	if m.mion != nil && m.mion.Role() != "client" {
+		return
+	}
 	backoff := time.Second
 	const maxBackoff = 15 * time.Second
 	for {
