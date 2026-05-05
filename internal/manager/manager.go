@@ -46,10 +46,10 @@ type peerEntry struct {
 const defaultSTUNServer = "stun4.l.google.com:3478"
 
 // probeCooldownDur is the minimum interval before retrying a probe to an
-// address that previously timed out. This prevents repeated probing of
-// unreachable candidates (e.g. IPv6-only hosts, asymmetric NAT) on every
-// relay reconnect.
-const probeCooldownDur = 3 * time.Minute
+// address that previously timed out. Kept short because relay reconnect already
+// clears the cooldown map; this only prevents duplicate probes within a single
+// relay session (e.g. if candidates are re-sent without a reconnect).
+const probeCooldownDur = 30 * time.Second
 
 type Manager struct {
 	selfID     identity.PeerID
@@ -291,15 +291,23 @@ func (m *Manager) relayConnectLoop(ctx context.Context, relayURL string, proxy *
 
 // setupRelayPeers establishes outbound sessions to all peers that use the given
 // relay. Called after each successful relay reconnect.
+// It resets per-peer direct-path state so probes run immediately with the new
+// relay session — without waiting for QUIC keepalive to detect a stale path.
 func (m *Manager) setupRelayPeers(ctx context.Context, relayURL string) {
-	m.mu.RLock()
+	// Reset direct-path state for all peers on this relay before dialling.
+	// The remote peer (e.g. proxy) may have restarted; its QUIC endpoint and
+	// DirectListener port may have changed. Clearing hasDirectPath allows
+	// validateCandidates to run probes immediately on the new candidates.
+	m.mu.Lock()
 	var ids []identity.PeerID
 	for id, entry := range m.peers {
 		if entry.relayURL == relayURL {
 			ids = append(ids, id)
+			entry.hasDirectPath = false
+			entry.h3Addrs = nil // proxy may have restarted with a new DirectListener port
 		}
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
 
 	for _, id := range ids {
 		if ctx.Err() != nil {
