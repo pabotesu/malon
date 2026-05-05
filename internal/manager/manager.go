@@ -553,23 +553,40 @@ func (m *Manager) sendCandidates(peerID identity.PeerID, rc *h2proxy.RelayTunnel
 		}
 	}
 
-	// Collect stuned candidate via STUN (both roles).
+	// Collect stuned candidate via STUN using the DirectListener's UDP socket.
+	// Using the same socket is mandatory: the XOR-MAPPED-ADDRESS must reflect
+	// the external IP:port of the exact socket peers will probe and connect to.
+	// A separate socket would give a different external port on symmetric NAT,
+	// making the candidate useless for hole punching.
 	stunCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv := m.stunServer
 	if srv == "" {
 		srv = defaultSTUNServer
 	}
-	stunAddr, err := stun.Query(stunCtx, srv)
 	var stunned []candidate.Candidate
-	if err != nil {
-		slog.Warn("manager: STUN query failed", "err", err)
+	if m.directLn != nil {
+		stunAddr, err := stun.QueryFromTransport(stunCtx, m.directLn.Transport(), srv)
+		if err != nil {
+			slog.Warn("manager: STUN query failed", "err", err)
+		} else {
+			stunned = []candidate.Candidate{{
+				Kind:       candidate.KindStuned,
+				Addr:       stunAddr,
+				Generation: gen,
+			}}
+		}
 	} else {
-		stunned = []candidate.Candidate{{
-			Kind:       candidate.KindStuned,
-			Addr:       stunAddr,
-			Generation: gen,
-		}}
+		stunAddr, err := stun.Query(stunCtx, srv)
+		if err != nil {
+			slog.Warn("manager: STUN query failed", "err", err)
+		} else {
+			stunned = []candidate.Candidate{{
+				Kind:       candidate.KindStuned,
+				Addr:       stunAddr,
+				Generation: gen,
+			}}
+		}
 	}
 
 	all := append(embedded, stunned...)
@@ -622,6 +639,13 @@ func (m *Manager) validateCandidates(peerID identity.PeerID, msg control.Message
 		addr, err := netip.ParseAddrPort(ci.Addr)
 		if err != nil {
 			slog.Warn("manager: invalid candidate addr", "addr", ci.Addr, "err", err)
+			continue
+		}
+		// Skip candidates whose IP version doesn't match the DirectListener socket.
+		// The DirectListener is bound to udp4, so IPv6 candidates cannot be reached
+		// from the same socket and would produce "non-IPv4 address" errors.
+		if m.directLn != nil && addr.Addr().Is6() {
+			slog.Debug("manager: skipping IPv6 candidate (DirectListener is IPv4-only)", "addr", addr)
 			continue
 		}
 		// Skip addresses that failed recently to avoid repeated timeout spam
