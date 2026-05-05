@@ -37,7 +37,9 @@ type peerEntry struct {
 // Manager coordinates transport paths for all known peers.
 // defaultSTUNServer uses the IPv4-only subdomain provided by Google to avoid
 // silent failures on hosts that have IPv6 configured but no working IPv6 route.
-const defaultSTUNServer = "stun4.l.google.com:19302"
+// Port 3478 is the standard STUN port (RFC 5389) and is more likely to be
+// unblocked on VPS/firewall environments than Google's alternative port 19302.
+const defaultSTUNServer = "stun4.l.google.com:3478"
 
 type Manager struct {
 	selfID     identity.PeerID
