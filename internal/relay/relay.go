@@ -40,6 +40,9 @@ func (r *Relay) ListenAndServe(addr, certFile, keyFile string) error {
 		Handler: http.HandlerFunc(r.handleHTTP),
 		TLSConfig: &tls.Config{
 			MinVersion: tls.VersionTLS13,
+			// Disable post-quantum KEX (X25519MLKEM768, default in Go 1.24+).
+			// Some middleboxes/ISPs drop the oversized TLS ClientHello it produces.
+			CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 		},
 	}
 	if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {

@@ -129,6 +129,10 @@ func (p *InternalProxy) Connect(ctx context.Context) error {
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: p.tlsInsecure, //nolint:gosec // intentional for testing
 				MinVersion:         tls.VersionTLS13,
+				// Disable post-quantum KEX (X25519MLKEM768, default in Go 1.24+).
+				// Some middleboxes/ISPs drop the oversized TLS ClientHello (~1400 bytes)
+				// it produces. Classical X25519 is still secure for practical purposes.
+				CurvePreferences: []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 			},
 			// Send HTTP/2 PING after 15s of inactivity and close the
 			// connection if not acknowledged within 5s. This ensures
