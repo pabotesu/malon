@@ -38,6 +38,7 @@ func NewClientTLSConfig(
 		MinVersion:            tls.VersionTLS13,
 		NextProtos:            []string{alpnMalonRelay},
 		VerifyPeerCertificate: makePeerVerifier(knownPeers),
+		CurvePreferences:      []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 	}, nil
 }
 
@@ -59,6 +60,7 @@ func NewServerTLSConfig(
 		MinVersion:            tls.VersionTLS13,
 		NextProtos:            []string{alpnMalonRelay},
 		VerifyPeerCertificate: makePeerVerifier(knownPeers),
+		CurvePreferences:      []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 	}, nil
 }
 
@@ -80,6 +82,7 @@ func NewProbeClientTLSConfig(
 		MinVersion:            tls.VersionTLS13,
 		NextProtos:            []string{alpnMalonProbe},
 		VerifyPeerCertificate: makePeerVerifier(knownPeers),
+		CurvePreferences:      []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 	}, nil
 }
 
@@ -101,6 +104,7 @@ func NewDirectClientTLSConfig(
 		MinVersion:            tls.VersionTLS13,
 		NextProtos:            []string{"h3"},
 		VerifyPeerCertificate: makePeerVerifier(knownPeers),
+		CurvePreferences:      []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 	}, nil
 }
 
@@ -123,6 +127,7 @@ func NewProbeServerTLSConfig(
 		MinVersion:            tls.VersionTLS13,
 		NextProtos:            []string{alpnMalonProbe, "h3"},
 		VerifyPeerCertificate: makePeerVerifier(knownPeers),
+		CurvePreferences:      []tls.CurveID{tls.X25519, tls.CurveP256, tls.CurveP384},
 	}, nil
 }
 
